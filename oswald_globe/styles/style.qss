@@ -1,0 +1,53 @@
+/* Oswald Globe Default Dark Stylesheet */
+
+QWidget#GlobeContainer {
+    background-color: #181a1f;
+    color: #e1e4e8;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+QLabel#TitleLabel {
+    font-weight: 600;
+    font-size: 14px;
+    color: #f0f6fc;
+}
+
+QLabel#StatusLabel {
+    font-size: 12px;
+    color: #8b949e;
+}
+
+QLabel#FooterLabel {
+    font-size: 11px;
+    color: #6e7681;
+}
+
+QPushButton.GlobeControlBtn {
+    background-color: rgba(30, 41, 59, 217);
+    color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 51);
+    border-radius: 4px;
+    font-size: 14px;
+    font-weight: bold;
+    min-width: 28px;
+    max-width: 28px;
+    min-height: 28px;
+    max-height: 28px;
+}
+
+QPushButton.GlobeControlBtn:hover {
+    background-color: rgba(51, 65, 85, 230);
+}
+
+QPushButton.GlobeControlBtn:checked {
+    background-color: rgba(59, 130, 246, 217);
+}
+
+QLabel#TooltipLabel {
+    background-color: rgba(15, 23, 42, 230);
+    color: #f8fafc;
+    border: 1px solid rgba(255, 255, 255, 51);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-size: 12px;
+}
