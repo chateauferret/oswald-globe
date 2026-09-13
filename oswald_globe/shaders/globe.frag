@@ -14,6 +14,8 @@ uniform float uLighting;
 uniform float uAtmosphere;
 uniform float uGraticule;
 uniform float uGraticuleStep;
+uniform vec3 uGraticuleColor;
+uniform float uGraticuleOpacity;
 uniform float uPixelSizeDeg;
 uniform float uUseVertexColor;
 uniform float uVmin;
@@ -67,7 +69,8 @@ void main() {
 
     float gridVal = max(lineLat, lineLon);
     float gridAlpha = mix(gridVal * 0.4, max(gridVal * 0.4, lineMajor * 0.75), lineMajor);
-    vec3 gridColor = mix(vec3(0.9, 0.95, 1.0), vec3(1.0, 0.85, 0.4), lineMajor * 0.35);
+    gridAlpha *= clamp(uGraticuleOpacity, 0.0, 1.0);
+    vec3 gridColor = mix(uGraticuleColor, vec3(1.0, 0.85, 0.4), lineMajor * 0.35);
 
     surfaceColor = mix(surfaceColor, gridColor, gridAlpha);
   }

@@ -37,6 +37,17 @@ from oswald_globe.utils import (
 SHADERS_DIR = Path(__file__).resolve().parent / "shaders"
 
 
+def _color_to_rgb(color: Union[QColor, Tuple[float, float, float], Tuple[float, float, float, float], str]) -> Tuple[float, float, float]:
+    if isinstance(color, QColor):
+        return (color.redF(), color.greenF(), color.blueF())
+    if isinstance(color, str):
+        qcolor = QColor(color)
+        if not qcolor.isValid():
+            raise ValueError(f"Invalid color value: {color!r}")
+        return (qcolor.redF(), qcolor.greenF(), qcolor.blueF())
+    return (float(color[0]), float(color[1]), float(color[2]))
+
+
 def _load_shader_source(filename: str) -> str:
     path = SHADERS_DIR / filename
     with path.open("r", encoding="utf-8") as f:
@@ -100,8 +111,12 @@ class GlobeGLWidget(QOpenGLWidget):
         auto_rotate: bool = False,
         lighting: bool = True,
         graticule: bool = True,
+        graticule_color: Union[QColor, Tuple[float, float, float], Tuple[float, float, float, float], str] = (0.9, 0.95, 1.0),
+        graticule_opacity: float = 1.0,
         mesh_grid: Optional[IcosphereGrid] = None,
         mesh_wireframe: bool = True,
+        mesh_color: Union[QColor, Tuple[float, float, float], Tuple[float, float, float, float], str] = (0.05, 0.05, 0.05),
+        mesh_opacity: float = 1.0,
         lat: float = 0.0,
         lon: float = 0.0,
         parent: Optional[QWidget] = None,
@@ -120,9 +135,13 @@ class GlobeGLWidget(QOpenGLWidget):
         self.resolution = float(resolution)
         self.lighting = bool(lighting)
         self.is_graticule = bool(graticule)
+        self.graticule_color = _color_to_rgb(graticule_color)
+        self.graticule_opacity = float(graticule_opacity)
         self.mesh_grid = mesh_grid
         self.has_mesh = mesh_grid is not None
         self.show_wireframe = bool(mesh_wireframe)
+        self.mesh_color = _color_to_rgb(mesh_color)
+        self.mesh_opacity = float(mesh_opacity)
 
         self.center_lat = math.radians(float(lat))
         self.center_lon = math.radians(float(lon))
@@ -317,12 +336,36 @@ class GlobeGLWidget(QOpenGLWidget):
         self.update()
 
     def toggle_graticule(self):
-        self.is_graticule = not self.is_graticule
+        self.set_graticule_settings(not self.is_graticule)
+
+    def toggle_mesh_wireframe(self):
+        self.set_mesh_wireframe_settings(not self.show_wireframe)
+
+    def set_graticule_settings(
+        self,
+        visible: bool,
+        color: Union[QColor, Tuple[float, float, float], Tuple[float, float, float, float], str, None] = None,
+        opacity: Optional[float] = None,
+    ):
+        self.is_graticule = bool(visible)
+        if color is not None:
+            self.graticule_color = _color_to_rgb(color)
+        if opacity is not None:
+            self.graticule_opacity = max(0.0, min(1.0, float(opacity)))
         self.btn_grid.setChecked(self.is_graticule)
         self.update()
 
-    def toggle_mesh_wireframe(self):
-        self.show_wireframe = not self.show_wireframe
+    def set_mesh_wireframe_settings(
+        self,
+        visible: bool,
+        color: Union[QColor, Tuple[float, float, float], Tuple[float, float, float, float], str, None] = None,
+        opacity: Optional[float] = None,
+    ):
+        self.show_wireframe = bool(visible)
+        if color is not None:
+            self.mesh_color = _color_to_rgb(color)
+        if opacity is not None:
+            self.mesh_opacity = max(0.0, min(1.0, float(opacity)))
         if self.btn_mesh:
             self.btn_mesh.setChecked(self.show_wireframe)
         self.update()
@@ -542,6 +585,7 @@ class GlobeGLWidget(QOpenGLWidget):
         u_atmosphere = glGetUniformLocation(self.program, "uAtmosphere")
         u_graticule = glGetUniformLocation(self.program, "uGraticule")
         u_graticule_step = glGetUniformLocation(self.program, "uGraticuleStep")
+        u_graticule_opacity = glGetUniformLocation(self.program, "uGraticuleOpacity")
         u_pixel_size_deg = glGetUniformLocation(self.program, "uPixelSizeDeg")
         u_use_vertex_color = glGetUniformLocation(self.program, "uUseVertexColor")
         u_vmin = glGetUniformLocation(self.program, "uVmin")
@@ -560,10 +604,12 @@ class GlobeGLWidget(QOpenGLWidget):
 
         glUniform1f(u_graticule, 1.0 if self.is_graticule else 0.0)
         glUniform1f(u_graticule_step, grat_step)
+        glUniform1f(u_graticule_opacity, self.graticule_opacity)
         glUniform1f(u_pixel_size_deg, pixel_size_deg)
         glUniform1f(u_use_vertex_color, 1.0 if self.has_mesh else 0.0)
         glUniform1f(u_vmin, self.vmin)
         glUniform1f(u_vmax, self.vmax)
+        glUniform3f(glGetUniformLocation(self.program, "uGraticuleColor"), *self.graticule_color)
 
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, self.texture_id)
@@ -607,11 +653,17 @@ class GlobeGLWidget(QOpenGLWidget):
             glUseProgram(self.line_program)
             line_u_p_matrix = glGetUniformLocation(self.line_program, "uPMatrix")
             line_u_mv_matrix = glGetUniformLocation(self.line_program, "uMVMatrix")
+            line_u_color = glGetUniformLocation(self.line_program, "uWireframeColor")
+            line_u_opacity = glGetUniformLocation(self.line_program, "uWireframeOpacity")
             line_a_position = glGetAttribLocation(self.line_program, "aPosition")
 
             glUniformMatrix4fv(line_u_p_matrix, 1, GL_FALSE, p_matrix)
             glUniformMatrix4fv(line_u_mv_matrix, 1, GL_FALSE, mv_matrix)
+            glUniform3f(line_u_color, *self.mesh_color)
+            glUniform1f(line_u_opacity, self.mesh_opacity)
 
+            glDepthMask(GL_FALSE)
+            glDepthFunc(GL_LEQUAL)
             if line_a_position >= 0:
                 glEnableVertexAttribArray(line_a_position)
                 glBindBuffer(GL_ARRAY_BUFFER, self.dual_pos_vbo)
@@ -622,6 +674,8 @@ class GlobeGLWidget(QOpenGLWidget):
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
             glDrawElements(GL_LINES, self.dual_line_count, GL_UNSIGNED_INT, None)
             glDisable(GL_BLEND)
+            glDepthMask(GL_TRUE)
+            glDepthFunc(GL_LESS)
 
     # ---------------- Mouse & Animation Handlers ----------------
 

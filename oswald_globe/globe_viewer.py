@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -269,8 +270,10 @@ class GlobeViewer(QWidget):
             auto_rotate=self.auto_rotate,
             lighting=self.lighting,
             graticule=self.show_graticule,
+            graticule_color=(0.9, 0.95, 1.0),
             mesh_grid=self.mesh_grid,
             mesh_wireframe=self.mesh_wireframe,
+            mesh_color=(0.05, 0.05, 0.05),
             lat=self.lat,
             lon=self.lon,
             parent=self,
@@ -354,6 +357,28 @@ class GlobeViewer(QWidget):
         self.gl_widget.vmin = self.vmin
         self.gl_widget.vmax = self.vmax
         self.gl_widget.update_texture()
+        return self
+
+    def set_graticule(
+        self,
+        enabled: bool,
+        color: Optional[Union[QColor, Tuple[float, float, float], str]] = None,
+        opacity: Optional[float] = None,
+    ) -> GlobeViewer:
+        """Set graticule visibility and optional color."""
+        self.show_graticule = bool(enabled)
+        self.gl_widget.set_graticule_settings(self.show_graticule, color, opacity)
+        return self
+
+    def set_mesh_wireframe(
+        self,
+        enabled: bool,
+        color: Optional[Union[QColor, Tuple[float, float, float], str]] = None,
+        opacity: Optional[float] = None,
+    ) -> GlobeViewer:
+        """Set icosphere wireframe visibility and optional color."""
+        self.mesh_wireframe = bool(enabled)
+        self.gl_widget.set_mesh_wireframe_settings(self.mesh_wireframe, color, opacity)
         return self
 
     def print_stats(self) -> None:

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oswald-globe"
+version = "0.1.0"
+description = "Interactive 3D desktop globe viewer in PySide6 and PyOpenGL."
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.5.0",
+    "PyOpenGL>=3.1.5",
+    "PyOpenGL_accelerate>=3.1.5",
+    "numpy>=1.22.0",
+    "scipy>=1.9.0",
+    "matplotlib>=3.5.0",
+    "Pillow>=9.0.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0.0"]
+
+[tool.setuptools.packages.find]
+include = ["oswald_globe*"]
