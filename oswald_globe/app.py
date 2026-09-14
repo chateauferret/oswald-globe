@@ -10,7 +10,7 @@ from typing import Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QDir, QObject, QSettings, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QDir, QObject, QSettings, QThread, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QImageReader, QSurfaceFormat
 from PySide6.QtWidgets import (
     QApplication,
@@ -49,6 +49,18 @@ except ImportError:  # pragma: no cover - supports running as a script
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HEIGHTFIELD = PACKAGE_ROOT / "data" / "heightfield.tif"
 APP_SETTINGS = QSettings("Oswald Globe", "Oswald Globe")
+
+
+def _empty_globe_elevation() -> np.ndarray:
+    """Return a sea-level data array for a default globe without a heightfield."""
+    return np.zeros((2, 2), dtype=np.float32)
+
+
+def _generic_icosphere_mesh(level: int = 7) -> IcosphereGrid:
+    """Build a uniform icosphere mesh at the requested subdivision level."""
+    mesh = IcosphereGrid()
+    mesh.subdivide_uniform(max(0, int(level)))
+    return mesh
 
 
 def load_elevation(heightfield: Path) -> np.ndarray:
@@ -228,9 +240,6 @@ class IcosphereProgressDialog(QDialog):
         self._stage_bars: Dict[str, QProgressBar] = {}
 
         layout = QVBoxLayout(self)
-        self._status_label = QLabel("Preparing heightfield load...", self)
-        layout.addWidget(self._status_label)
-
         for phase, title in self._STAGES:
             row_layout = QVBoxLayout()
             title_layout = QHBoxLayout()
@@ -264,6 +273,11 @@ class IcosphereProgressDialog(QDialog):
     def update_progress(self, phase: str, done: int, total: int) -> None:
         progress_bar = self._stage_bars[phase]
         state_label = self._stage_labels[phase]
+        if total <= 0:
+            progress_bar.setRange(0, 0)
+            progress_bar.setFormat("Working...")
+            state_label.setText("Running")
+            return
         maximum = max(1, int(total))
         progress_bar.setRange(0, maximum)
         progress_bar.setValue(min(int(done), maximum))
@@ -274,7 +288,6 @@ class IcosphereProgressDialog(QDialog):
             state_label.setText("Running")
         else:
             state_label.setText("Starting")
-        self._status_label.setText(f"{self._phase_title(phase)}: {done:,} / {maximum:,}")
 
     def start_stage(self, phase: str, total: int = 1) -> None:
         progress_bar = self._stage_bars[phase]
@@ -284,28 +297,20 @@ class IcosphereProgressDialog(QDialog):
         progress_bar.setValue(0)
         progress_bar.setFormat(f"0 / {maximum:,}")
         state_label.setText("Running")
-        self._status_label.setText(f"{self._phase_title(phase)}: 0 / {maximum:,}")
 
     def finish_stage(self, phase: str, total: int = 1) -> None:
         self.update_progress(phase, total, total)
 
-    def set_stage_busy(self, phase: str, message: Optional[str] = None) -> None:
+    def set_stage_busy(self, phase: str) -> None:
         progress_bar = self._stage_bars[phase]
         state_label = self._stage_labels[phase]
         progress_bar.setRange(0, 0)
         progress_bar.setFormat("Working...")
         state_label.setText("Running")
-        self._status_label.setText(message or self._phase_title(phase))
-
-    def _phase_title(self, phase: str) -> str:
-        for stage_phase, title in self._STAGES:
-            if stage_phase == phase:
-                return title
-        return phase
 
     def show_cancelling(self) -> None:
-        self._status_label.setText("Cancelling icosphere build...")
         self._cancel_button.setEnabled(False)
+        self.setWindowTitle("Cancelling Heightfield Load")
 
 
 class IcosphereBuildWorker(QObject):
@@ -350,7 +355,7 @@ class IcosphereBuildWorker(QObject):
 class GlobeMainWindow(QMainWindow):
     def __init__(
         self,
-        heightfield: Path = DEFAULT_HEIGHTFIELD,
+        heightfield: Optional[Path] = None,
         mesh_min_level: int = 2,
         mesh_max_level: int = 7,
         mesh_threshold: float = 100.0,
@@ -371,8 +376,10 @@ class GlobeMainWindow(QMainWindow):
         self._progress_dialog: Optional[IcosphereProgressDialog] = None
         self._pending_heightfield: Optional[Path] = None
         self._pending_elevation: Optional[np.ndarray] = None
+        self._pending_viewer: Optional[GlobeViewer] = None
+        self._heightfield: Optional[Path] = None
 
-        self._set_heightfield(Path(heightfield))
+        self._set_heightfield(heightfield)
         self.resize(width, height)
         self.setMinimumSize(480, 540)
         self._build_menu_bar()
@@ -510,26 +517,45 @@ class GlobeMainWindow(QMainWindow):
     @Slot(object)
     def _on_heightfield_load_completed(self, grid: object) -> None:
         if self._progress_dialog is not None:
-            self._progress_dialog.set_stage_busy("displaying-globe", "Displaying globe...")
+            self._progress_dialog.set_stage_busy("displaying-globe")
         if self._pending_heightfield is None or self._pending_elevation is None:
             raise RuntimeError("Heightfield load completed without pending input data.")
         self._set_heightfield(self._pending_heightfield, elevation=self._pending_elevation, mesh_grid=grid)
-        if self._progress_dialog is not None:
-            self._progress_dialog.finish_stage("displaying-globe")
-            self._progress_dialog.close()
+        self._pending_viewer = self.viewer
+        self._pending_viewer.gl_widget.firstFrameRendered.connect(self._finish_heightfield_display)
+        self._pending_viewer.gl_widget.update()
+        QTimer.singleShot(0, self._pending_viewer.gl_widget.update)
 
     @Slot(object)
     def _on_heightfield_load_failed(self, exc: object) -> None:
-        if self._progress_dialog is not None:
-            self._progress_dialog.close()
+        self._close_progress_dialog()
         if not isinstance(exc, Exception):
             raise RuntimeError(f"Heightfield load failed with unexpected error payload: {exc!r}")
         QMessageBox.critical(self, "Failed to load heightfield", str(exc))
 
     @Slot()
     def _on_heightfield_load_cancelled(self) -> None:
+        self._close_progress_dialog()
+
+    @Slot()
+    def _finish_heightfield_display(self) -> None:
+        if self._pending_viewer is None:
+            return
+        try:
+            self._pending_viewer.gl_widget.firstFrameRendered.disconnect(self._finish_heightfield_display)
+        except (RuntimeError, TypeError):
+            pass
         if self._progress_dialog is not None:
-            self._progress_dialog.close()
+            self._progress_dialog.finish_stage("displaying-globe")
+        QTimer.singleShot(0, self._close_progress_dialog)
+
+    def _close_progress_dialog(self) -> None:
+        if self._progress_dialog is None:
+            return
+        self._progress_dialog.close()
+        self._progress_dialog.deleteLater()
+        self._progress_dialog = None
+        self._pending_viewer = None
 
     @Slot()
     def _cleanup_heightfield_load(self) -> None:
@@ -539,28 +565,54 @@ class GlobeMainWindow(QMainWindow):
         if self._load_thread is not None:
             self._load_thread.deleteLater()
             self._load_thread = None
-        if self._progress_dialog is not None:
-            self._progress_dialog.deleteLater()
-            self._progress_dialog = None
         self._pending_heightfield = None
         self._pending_elevation = None
 
     def _set_heightfield(
         self,
-        heightfield: Path,
+        heightfield: Optional[Path],
         *,
         elevation: Optional[np.ndarray] = None,
         mesh_grid: Optional[IcosphereGrid] = None,
     ) -> None:
+        existing_settings = None
+        if isinstance(self.centralWidget(), GlobeViewer):
+            existing_settings = self._current_grid_settings()
+
+        if heightfield is None:
+            elevation_data = _empty_globe_elevation() if elevation is None else np.asarray(elevation, dtype=np.float32)
+            view_title = "Sea level"
+            mesh = mesh_grid if mesh_grid is not None else _generic_icosphere_mesh(self._mesh_max_level)
+            viewer = GlobeViewer(
+                elevation_data,
+                cmap=load_topo_cmap(self._ensure_current_legend(), name=self._legend_name(self._current_legend)),
+                responsive=True,
+                title=view_title,
+                mesh=mesh,
+                mesh_min_level=self._mesh_min_level,
+                mesh_max_level=self._mesh_max_level,
+                mesh_threshold=self._mesh_threshold,
+            )
+            if existing_settings is not None:
+                self._apply_grid_settings_to_viewer(viewer, existing_settings)
+            else:
+                self._load_grid_settings(viewer)
+
+            old_viewer = self.centralWidget()
+            self.setCentralWidget(viewer)
+            if old_viewer is not None:
+                old_viewer.deleteLater()
+
+            self.setWindowTitle(view_title)
+            self._heightfield = None
+            self._save_path = None
+            return
+
         heightfield = Path(heightfield).expanduser().resolve()
         if not heightfield.is_file():
             raise FileNotFoundError(f"Heightfield not found: {heightfield}")
 
         elevation_data = load_elevation(heightfield) if elevation is None else np.asarray(elevation, dtype=np.float32)
-        existing_settings = None
-        if isinstance(self.centralWidget(), GlobeViewer):
-            existing_settings = self._current_grid_settings()
-
         viewer = GlobeViewer(
             elevation_data,
             cmap=load_topo_cmap(self._ensure_current_legend(), name=self._legend_name(self._current_legend)),
@@ -680,7 +732,8 @@ class GlobeMainWindow(QMainWindow):
         return f"Image Files ({patterns});;All Files (*)"
 
     def _create_open_heightfield_dialog(self) -> QFileDialog:
-        dialog = QFileDialog(self, "Open Heightfield", str(self._heightfield.parent))
+        starting_dir = self._heightfield.parent if self._heightfield is not None else Path.cwd()
+        dialog = QFileDialog(self, "Open Heightfield", str(starting_dir))
         dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
         dialog.setNameFilter(self._image_file_filter())
@@ -718,10 +771,11 @@ class GlobeMainWindow(QMainWindow):
         self._save_heightfield(self._save_path)
 
     def save_heightfield_as(self) -> None:
+        default_path = (self._heightfield.with_suffix(".npy") if self._heightfield is not None else Path("sea_level.npy"))
         file_name, _ = QFileDialog.getSaveFileName(
             self,
             "Save Heightfield",
-            str(self._heightfield.with_suffix(".npy")),
+            str(default_path),
             "NumPy Array (*.npy);;Compressed NumPy Array (*.npz);;TIFF (*.tif *.tiff)",
         )
         if file_name:
@@ -743,7 +797,7 @@ class GlobeMainWindow(QMainWindow):
 
 
 def create_window(
-    heightfield: Path = DEFAULT_HEIGHTFIELD,
+    heightfield: Optional[Path] = None,
     mesh_min_level: int = 2,
     mesh_max_level: int = 7,
     mesh_threshold: float = 100.0,
@@ -775,9 +829,9 @@ def _configure_opengl_surface_format() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Interactive 3D heightfield desktop globe.")
-    parser.add_argument("--heightfield", type=Path, default=DEFAULT_HEIGHTFIELD)
+    parser.add_argument("--heightfield", type=Path, default=None, help="Optional raster file to load. Defaults to a sea-level globe.")
     parser.add_argument("--mesh-min-level", type=int, default=2, help="Minimum icosphere subdivision level.")
-    parser.add_argument("--mesh-max-level", type=int, default=8, help="Maximum icosphere subdivision level.")
+    parser.add_argument("--mesh-max-level", type=int, default=7, help="Maximum icosphere subdivision level.")
     parser.add_argument("--mesh-threshold", type=float, default=100.0, help="Gradient threshold driving adaptive refinement.")
     parser.add_argument("--width", type=int, default=850, help="Window width in pixels.")
     parser.add_argument("--height", type=int, default=900, help="Window height in pixels.")

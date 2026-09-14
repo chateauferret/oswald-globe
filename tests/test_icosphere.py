@@ -128,11 +128,13 @@ def test_from_equirectangular_reports_creation_and_population_progress():
 
     assert creation_updates[0] == ("creating-faces", 0, 20 * 4 ** 4)
     assert creation_updates[-1] == ("creating-faces", 20 * 4 ** 4, 20 * 4 ** 4)
-    assert balance_updates[0][0] == "balancing-faces"
-    assert balance_updates[0][1] == 0
+    assert balance_updates[0] == ("balancing-faces", 0, 1)
     assert balance_updates[-1][1] == balance_updates[-1][2]
+    assert balance_updates[-1][1] >= 1
     assert population_updates[0][0] == "populating-faces"
     assert population_updates[0][1] == 0
+    assert population_updates[0][2] == 0
+    assert population_updates[1][2] == grid.face_count()
     assert population_updates[-1] == ("populating-faces", grid.face_count(), grid.face_count())
 
 

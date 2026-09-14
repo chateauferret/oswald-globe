@@ -25,6 +25,19 @@ def test_load_elevation(tmp_path: Path):
     np.testing.assert_allclose(elev, 1024.0, atol=1e-3)
 
 
+def test_create_window_defaults_to_empty_sea_level_globe(qapp):
+    window = create_window()
+    try:
+        assert window._heightfield is None
+        assert window.windowTitle() == "Sea level"
+        assert window.viewer.data.shape == (2, 2)
+        np.testing.assert_allclose(window.viewer.data, 0.0)
+        assert window.viewer.mesh_grid is not None
+        assert len(window.viewer.mesh_grid.vertices) > 0
+    finally:
+        window.close()
+
+
 def test_resources_module_importable():
     from oswald_globe import resources_rc
 

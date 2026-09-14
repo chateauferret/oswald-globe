@@ -68,6 +68,16 @@ class _ProgressTracker:
         self._last_emitted = self.done
 
 
+def _emit_progress(
+    callback: Optional[Callable[[str, int, int], None]],
+    phase: str,
+    done: int,
+    total: int,
+) -> None:
+    if callback is not None:
+        callback(phase, done, total)
+
+
 def _xyz_to_latlon(xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Convert unit-sphere xyz coordinates (..., 3) to (lat_deg, lon_deg)."""
     x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
@@ -423,12 +433,13 @@ class IcosphereGrid:
         is_cancelled: Optional[Callable[[], bool]] = None,
     ):
         """Enforce a 2:1 balance."""
-        changed = True
-        while changed:
+        pass_count = 0
+        while True:
             self._check_cancelled(is_cancelled)
+            pass_count += 1
+            _emit_progress(progress_callback, "balancing-faces", pass_count - 1, pass_count)
             changed = False
             leaves = self._red_leaves()
-            balance_progress = _ProgressTracker("balancing-faces", len(leaves), progress_callback)
             for f in leaves:
                 self._check_cancelled(is_cancelled)
                 v0, v1, v2 = f.v
@@ -440,18 +451,11 @@ class IcosphereGrid:
                     for child in f.children:
                         self._ensure_values(child.v, value_fn)
                     changed = True
-                balance_progress.advance(1)
             if changed:
                 self._invalidate_caches()
-            balance_progress.finish()
-
-        final_leaves = self._red_leaves()
-        final_balance_progress = _ProgressTracker("balancing-faces", len(final_leaves), progress_callback)
-        for f in final_leaves:
-            self._check_cancelled(is_cancelled)
-            self._ensure_values(f.v, value_fn)
-            final_balance_progress.advance(1)
-        final_balance_progress.finish()
+                continue
+            break
+        _emit_progress(progress_callback, "balancing-faces", pass_count, pass_count)
 
     def _populate_face_values(
         self,
@@ -459,6 +463,7 @@ class IcosphereGrid:
         progress_callback: Optional[Callable[[str, int, int], None]] = None,
         is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> None:
+        _emit_progress(progress_callback, "populating-faces", 0, 0)
         leaves = self.leaf_faces()
         population_progress = _ProgressTracker("populating-faces", len(leaves), progress_callback)
         for face in leaves:

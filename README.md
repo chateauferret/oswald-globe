@@ -21,12 +21,12 @@ pip install -r requirements.txt
 
 ## Running the Application
 
-Launch the default heightfield globe:
+Launch the default sea-level globe:
 ```bash
 python app.py
 ```
 
-Or pass custom parameters:
+Or load a custom heightfield raster:
 ```bash
 python app.py --heightfield path/to/heightfield.tif --mesh-min-level 2 --mesh-max-level 7 --mesh-threshold 100.0
 ```

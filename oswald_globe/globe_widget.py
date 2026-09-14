@@ -97,6 +97,7 @@ class GlobeGLWidget(QOpenGLWidget):
 
     statusChanged = Signal(float, float, float)  # lat_deg, lon_deg, zoom
     centerChanged = Signal(float, float)        # lat_deg, lon_deg
+    firstFrameRendered = Signal()
 
     def __init__(
         self,
@@ -176,6 +177,7 @@ class GlobeGLWidget(QOpenGLWidget):
         self.index_count = 0
         self.dual_line_count = 0
         self._gl_initialized = False
+        self._first_frame_rendered = False
 
         # Animation timer (approx 60 FPS)
         self.anim_timer = QTimer(self)
@@ -676,6 +678,10 @@ class GlobeGLWidget(QOpenGLWidget):
             glDisable(GL_BLEND)
             glDepthMask(GL_TRUE)
             glDepthFunc(GL_LESS)
+
+        if not self._first_frame_rendered:
+            self._first_frame_rendered = True
+            self.firstFrameRendered.emit()
 
     # ---------------- Mouse & Animation Handlers ----------------
 
