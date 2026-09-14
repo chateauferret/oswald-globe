@@ -50,6 +50,11 @@ def test_globe_viewer_with_topo_colormap(qapp):
     assert viewer.vmax == 4000.0
 
 
+def test_load_topo_cmap_from_resource():
+    grayscale = load_topo_cmap(":/legends/grayscale.txt")
+    assert grayscale.name == "grayscale"
+
+
 def test_globe_viewer_pil_image(qapp):
     pil_img = Image.new("F", (360, 180), color=42.0)
     viewer = GlobeViewer(pil_img)

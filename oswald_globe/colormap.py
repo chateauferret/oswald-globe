@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import ast
-from pathlib import Path
-from typing import Any, Optional
+from pathlib import Path, PurePosixPath
+from typing import Any, Optional, Union
 
 import numpy as np
+from PySide6.QtCore import QFile, QIODevice
+
+try:
+    from . import resources_rc  # noqa: F401
+except ImportError:  # pragma: no cover - supports running as a script
+    from oswald_globe import resources_rc  # noqa: F401
 
 try:
     import matplotlib.pyplot as plt
@@ -15,8 +21,8 @@ except ImportError:  # pragma: no cover - exercised in matplotlib-free environme
     plt = None
     LinearSegmentedColormap = Any  # type: ignore[assignment]
 
-LEGENDS_DIR = Path(__file__).resolve().parent.parent / "legends"
-DEFAULT_TOPO_LEGEND = LEGENDS_DIR / "topography.txt"
+LEGENDS_DIR = Path(__file__).resolve().parent / "resources" / "legends"
+DEFAULT_TOPO_LEGEND = ":/legends/topography.txt"
 
 
 class _FallbackColormap:
@@ -50,14 +56,9 @@ def _terrain_anchors() -> np.ndarray:
     )
 
 
-def _fallback_colormap(name: str) -> _FallbackColormap:
-    if name.lower() == "topo":
-        path = DEFAULT_TOPO_LEGEND
-        if path.is_file():
-            with path.open("r", encoding="utf-8") as f:
-                cdict = ast.literal_eval(f.read())
-            return _FallbackColormap("topo", _anchors_from_cdict(cdict))
-    return _FallbackColormap(name, _terrain_anchors())
+def _fallback_colormap(name: str, cdict: Optional[dict[str, Any]] = None) -> _FallbackColormap:
+    anchors = _anchors_from_cdict(cdict) if cdict else _terrain_anchors()
+    return _FallbackColormap(name, anchors)
 
 
 def _anchors_from_cdict(cdict: dict[str, Any]) -> np.ndarray:
@@ -79,6 +80,36 @@ def _anchors_from_cdict(cdict: dict[str, Any]) -> np.ndarray:
     return anchors
 
 
+def _legend_name(legend_path: Optional[Union[str, Path]]) -> str:
+    raw = str(legend_path if legend_path is not None else DEFAULT_TOPO_LEGEND)
+    if raw.startswith(":/"):
+        return PurePosixPath(raw.removeprefix(":/")).stem
+    return Path(raw).stem
+
+
+def _read_legend_text(legend_path: Optional[Union[str, Path]]) -> Optional[str]:
+    candidates = [legend_path] if legend_path is not None else [DEFAULT_TOPO_LEGEND, LEGENDS_DIR / "topography.txt"]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+
+        raw = str(candidate)
+        if raw.startswith(":/"):
+            resource = QFile(raw)
+            if not resource.open(QIODevice.OpenModeFlag.ReadOnly | QIODevice.OpenModeFlag.Text):
+                continue
+            try:
+                return bytes(resource.readAll()).decode("utf-8")
+            finally:
+                resource.close()
+
+        path = Path(candidate)
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+
+    return None
+
+
 def get_named_cmap(name: str):
     if plt is not None:
         try:
@@ -88,19 +119,16 @@ def get_named_cmap(name: str):
     return _fallback_colormap(name)
 
 
-def load_topo_cmap(legend_path: Optional[Path] = None):
+def load_topo_cmap(legend_path: Optional[Union[str, Path]] = None, *, name: Optional[str] = None):
     """Load the custom topographic colormap from legend data file."""
-    path = Path(legend_path) if legend_path is not None else DEFAULT_TOPO_LEGEND
-    if plt is None:
-        if not path.is_file():
-            return _fallback_colormap("terrain")
-        with path.open("r", encoding="utf-8") as f:
-            cdict = ast.literal_eval(f.read())
-        return _fallback_colormap("topo") if not cdict else _FallbackColormap("topo", _anchors_from_cdict(cdict))
-
-    if not path.is_file():
+    cmap_name = name or _legend_name(legend_path)
+    legend_text = _read_legend_text(legend_path)
+    if legend_text is None:
+        if plt is None:
+            return _fallback_colormap(cmap_name)
         return plt.get_cmap("terrain")
 
-    with path.open("r", encoding="utf-8") as f:
-        cdict = ast.literal_eval(f.read())
-    return LinearSegmentedColormap("topo", cdict)
+    cdict = ast.literal_eval(legend_text)
+    if plt is None:
+        return _fallback_colormap(cmap_name, cdict if cdict else None)
+    return LinearSegmentedColormap(cmap_name, cdict)

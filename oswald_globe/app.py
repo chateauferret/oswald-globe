@@ -4,31 +4,47 @@ from __future__ import annotations
 
 import argparse
 import sys
+from threading import Event
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QSettings
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QSurfaceFormat
+from PySide6.QtCore import QDir, QObject, QSettings, QThread, Qt, Signal, Slot
+from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QImageReader, QSurfaceFormat
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QColorDialog,
     QDialog,
     QDialogButtonBox,
+    QCheckBox,
+    QColorDialog,
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
+    QProgressBar,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from oswald_globe.globe_viewer import GlobeViewer
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+try:
+    from . import resources_rc  # noqa: F401
+    from .colormap import DEFAULT_TOPO_LEGEND, LEGENDS_DIR, load_topo_cmap
+    from .globe_viewer import GlobeViewer
+    from .icosphere import IcosphereBuildCancelled, IcosphereGrid
+except ImportError:  # pragma: no cover - supports running as a script
+    from oswald_globe import resources_rc  # noqa: F401
+    from oswald_globe.colormap import DEFAULT_TOPO_LEGEND, LEGENDS_DIR, load_topo_cmap
+    from oswald_globe.globe_viewer import GlobeViewer
+    from oswald_globe.icosphere import IcosphereBuildCancelled, IcosphereGrid
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HEIGHTFIELD = PACKAGE_ROOT / "data" / "heightfield.tif"
@@ -191,6 +207,146 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+class IcosphereProgressDialog(QDialog):
+    cancelRequested = Signal()
+    _STAGES = (
+        ("loading-heightfield", "Loading heightfield file"),
+        ("creating-faces", "Creating icosphere faces"),
+        ("balancing-faces", "Balancing icosphere faces"),
+        ("populating-faces", "Populating globe data"),
+        ("displaying-globe", "Displaying globe"),
+    )
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Loading Heightfield")
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        self._stage_labels: Dict[str, QLabel] = {}
+        self._stage_bars: Dict[str, QProgressBar] = {}
+
+        layout = QVBoxLayout(self)
+        self._status_label = QLabel("Preparing heightfield load...", self)
+        layout.addWidget(self._status_label)
+
+        for phase, title in self._STAGES:
+            row_layout = QVBoxLayout()
+            title_layout = QHBoxLayout()
+
+            title_label = QLabel(title, self)
+            state_label = QLabel("Pending", self)
+            title_layout.addWidget(title_label)
+            title_layout.addStretch()
+            title_layout.addWidget(state_label)
+
+            progress_bar = QProgressBar(self)
+            progress_bar.setRange(0, 1)
+            progress_bar.setValue(0)
+            progress_bar.setFormat("Pending")
+
+            row_layout.addLayout(title_layout)
+            row_layout.addWidget(progress_bar)
+            layout.addLayout(row_layout)
+
+            self._stage_labels[phase] = state_label
+            self._stage_bars[phase] = progress_bar
+
+        buttons = QDialogButtonBox(self)
+        self._cancel_button = buttons.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        self._cancel_button.clicked.connect(self.cancel)
+        layout.addWidget(buttons)
+
+    def cancel(self) -> None:
+        self.cancelRequested.emit()
+
+    def update_progress(self, phase: str, done: int, total: int) -> None:
+        progress_bar = self._stage_bars[phase]
+        state_label = self._stage_labels[phase]
+        maximum = max(1, int(total))
+        progress_bar.setRange(0, maximum)
+        progress_bar.setValue(min(int(done), maximum))
+        progress_bar.setFormat(f"{done:,} / {maximum:,}")
+        if done >= maximum:
+            state_label.setText("Done")
+        elif done > 0:
+            state_label.setText("Running")
+        else:
+            state_label.setText("Starting")
+        self._status_label.setText(f"{self._phase_title(phase)}: {done:,} / {maximum:,}")
+
+    def start_stage(self, phase: str, total: int = 1) -> None:
+        progress_bar = self._stage_bars[phase]
+        state_label = self._stage_labels[phase]
+        maximum = max(1, int(total))
+        progress_bar.setRange(0, maximum)
+        progress_bar.setValue(0)
+        progress_bar.setFormat(f"0 / {maximum:,}")
+        state_label.setText("Running")
+        self._status_label.setText(f"{self._phase_title(phase)}: 0 / {maximum:,}")
+
+    def finish_stage(self, phase: str, total: int = 1) -> None:
+        self.update_progress(phase, total, total)
+
+    def set_stage_busy(self, phase: str, message: Optional[str] = None) -> None:
+        progress_bar = self._stage_bars[phase]
+        state_label = self._stage_labels[phase]
+        progress_bar.setRange(0, 0)
+        progress_bar.setFormat("Working...")
+        state_label.setText("Running")
+        self._status_label.setText(message or self._phase_title(phase))
+
+    def _phase_title(self, phase: str) -> str:
+        for stage_phase, title in self._STAGES:
+            if stage_phase == phase:
+                return title
+        return phase
+
+    def show_cancelling(self) -> None:
+        self._status_label.setText("Cancelling icosphere build...")
+        self._cancel_button.setEnabled(False)
+
+
+class IcosphereBuildWorker(QObject):
+    progressChanged = Signal(str, int, int)
+    completed = Signal(object)
+    failed = Signal(object)
+    cancelled = Signal()
+
+    def __init__(self, elevation: np.ndarray, min_level: int, max_level: int, threshold: float):
+        super().__init__()
+        self._elevation = np.asarray(elevation, dtype=np.float32)
+        self._min_level = min_level
+        self._max_level = max_level
+        self._threshold = threshold
+        self._cancel_event = Event()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            grid = IcosphereGrid.from_equirectangular(
+                self._elevation,
+                min_level=self._min_level,
+                max_level=self._max_level,
+                threshold=self._threshold,
+                progress_callback=self.progressChanged.emit,
+                is_cancelled=self._cancel_event.is_set,
+            )
+        except IcosphereBuildCancelled:
+            self.cancelled.emit()
+            return
+        except Exception as exc:
+            self.failed.emit(exc)
+            return
+
+        self.completed.emit(grid)
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+
 class GlobeMainWindow(QMainWindow):
     def __init__(
         self,
@@ -208,6 +364,13 @@ class GlobeMainWindow(QMainWindow):
         self._mesh_threshold = mesh_threshold
         self._save_path: Optional[Path] = None
         self._settings = settings or APP_SETTINGS
+        self._legend_action_group: Optional[QActionGroup] = None
+        self._current_legend = self._load_current_legend()
+        self._load_thread: Optional[QThread] = None
+        self._load_worker: Optional[IcosphereBuildWorker] = None
+        self._progress_dialog: Optional[IcosphereProgressDialog] = None
+        self._pending_heightfield: Optional[Path] = None
+        self._pending_elevation: Optional[np.ndarray] = None
 
         self._set_heightfield(Path(heightfield))
         self.resize(width, height)
@@ -239,22 +402,171 @@ class GlobeMainWindow(QMainWindow):
         settings_action.triggered.connect(self.open_settings)
         file_menu.addAction(settings_action)
 
-    def _set_heightfield(self, heightfield: Path) -> None:
+        self.menuBar().addMenu("Edit")
+
+        view_menu = self.menuBar().addMenu("View")
+        self._legend_menu = view_menu.addMenu("Legend")
+        self._legend_menu.aboutToShow.connect(self._populate_legend_menu)
+
+    def _legend_name(self, legend_source: Union[str, Path]) -> str:
+        return Path(str(legend_source).removeprefix(":/")).stem
+
+    def _available_legend_sources(self) -> list[str]:
+        resource_dir = QDir(":/legends")
+        resource_legends = resource_dir.entryList(["*.txt"], QDir.Filter.Files, QDir.SortFlag.Name)
+        if resource_legends:
+            return [f":/legends/{legend}" for legend in resource_legends]
+
+        if LEGENDS_DIR.is_dir():
+            return [str(path) for path in sorted(LEGENDS_DIR.glob("*.txt"))]
+
+        return []
+
+    def _default_legend_source(self) -> str:
+        legends = self._available_legend_sources()
+        if not legends:
+            return DEFAULT_TOPO_LEGEND
+
+        for legend in legends:
+            if self._legend_name(legend) == "topography":
+                return legend
+        return legends[0]
+
+    def _load_current_legend(self) -> str:
+        stored = str(self._settings.value("legend/current", DEFAULT_TOPO_LEGEND))
+        available = self._available_legend_sources()
+        if stored in available:
+            return stored
+        return self._default_legend_source()
+
+    def _ensure_current_legend(self) -> str:
+        available = self._available_legend_sources()
+        if self._current_legend in available:
+            return self._current_legend
+        self._current_legend = self._default_legend_source()
+        return self._current_legend
+
+    def _populate_legend_menu(self) -> None:
+        self._legend_menu.clear()
+
+        legends = self._available_legend_sources()
+        if not legends:
+            no_legends_action = self._legend_menu.addAction("No legends available")
+            no_legends_action.setEnabled(False)
+            self._legend_action_group = None
+            return
+
+        current_legend = self._ensure_current_legend()
+        self._legend_action_group = QActionGroup(self._legend_menu)
+        self._legend_action_group.setExclusive(True)
+        for legend_source in legends:
+            action = self._legend_menu.addAction(self._legend_name(legend_source))
+            action.setCheckable(True)
+            action.setChecked(legend_source == current_legend)
+            action.triggered.connect(lambda checked=False, source=legend_source: self.set_legend(source))
+            self._legend_action_group.addAction(action)
+
+    def set_legend(self, legend_source: Union[str, Path]) -> None:
+        legend_value = str(legend_source)
+        if legend_value not in self._available_legend_sources():
+            raise FileNotFoundError(f"Legend not found: {legend_value}")
+
+        self._current_legend = legend_value
+        self._settings.setValue("legend/current", legend_value)
+        self.viewer.set_colormap(load_topo_cmap(legend_value, name=self._legend_name(legend_value)))
+
+    def _start_heightfield_load(self, heightfield: Path, elevation: np.ndarray) -> None:
+        if self._load_thread is not None:
+            raise RuntimeError("A heightfield load is already in progress.")
+
+        self._pending_heightfield = Path(heightfield).expanduser().resolve()
+        self._pending_elevation = np.asarray(elevation, dtype=np.float32)
+        if self._progress_dialog is None:
+            self._progress_dialog = IcosphereProgressDialog(self)
+        self._load_thread = QThread(self)
+        self._load_worker = IcosphereBuildWorker(
+            self._pending_elevation,
+            min_level=self._mesh_min_level,
+            max_level=self._mesh_max_level,
+            threshold=self._mesh_threshold,
+        )
+        self._load_worker.moveToThread(self._load_thread)
+
+        self._load_thread.started.connect(self._load_worker.run)
+        self._load_worker.progressChanged.connect(self._progress_dialog.update_progress)
+        self._load_worker.completed.connect(self._on_heightfield_load_completed)
+        self._load_worker.failed.connect(self._on_heightfield_load_failed)
+        self._load_worker.cancelled.connect(self._on_heightfield_load_cancelled)
+        self._load_worker.completed.connect(self._load_thread.quit)
+        self._load_worker.failed.connect(self._load_thread.quit)
+        self._load_worker.cancelled.connect(self._load_thread.quit)
+        self._load_thread.finished.connect(self._cleanup_heightfield_load)
+        self._progress_dialog.cancelRequested.connect(self._load_worker.cancel)
+        self._progress_dialog.cancelRequested.connect(self._progress_dialog.show_cancelling)
+
+        self._progress_dialog.show()
+        self._load_thread.start()
+
+    @Slot(object)
+    def _on_heightfield_load_completed(self, grid: object) -> None:
+        if self._progress_dialog is not None:
+            self._progress_dialog.set_stage_busy("displaying-globe", "Displaying globe...")
+        if self._pending_heightfield is None or self._pending_elevation is None:
+            raise RuntimeError("Heightfield load completed without pending input data.")
+        self._set_heightfield(self._pending_heightfield, elevation=self._pending_elevation, mesh_grid=grid)
+        if self._progress_dialog is not None:
+            self._progress_dialog.finish_stage("displaying-globe")
+            self._progress_dialog.close()
+
+    @Slot(object)
+    def _on_heightfield_load_failed(self, exc: object) -> None:
+        if self._progress_dialog is not None:
+            self._progress_dialog.close()
+        if not isinstance(exc, Exception):
+            raise RuntimeError(f"Heightfield load failed with unexpected error payload: {exc!r}")
+        QMessageBox.critical(self, "Failed to load heightfield", str(exc))
+
+    @Slot()
+    def _on_heightfield_load_cancelled(self) -> None:
+        if self._progress_dialog is not None:
+            self._progress_dialog.close()
+
+    @Slot()
+    def _cleanup_heightfield_load(self) -> None:
+        if self._load_worker is not None:
+            self._load_worker.deleteLater()
+            self._load_worker = None
+        if self._load_thread is not None:
+            self._load_thread.deleteLater()
+            self._load_thread = None
+        if self._progress_dialog is not None:
+            self._progress_dialog.deleteLater()
+            self._progress_dialog = None
+        self._pending_heightfield = None
+        self._pending_elevation = None
+
+    def _set_heightfield(
+        self,
+        heightfield: Path,
+        *,
+        elevation: Optional[np.ndarray] = None,
+        mesh_grid: Optional[IcosphereGrid] = None,
+    ) -> None:
         heightfield = Path(heightfield).expanduser().resolve()
         if not heightfield.is_file():
             raise FileNotFoundError(f"Heightfield not found: {heightfield}")
 
-        elevation = load_elevation(heightfield)
+        elevation_data = load_elevation(heightfield) if elevation is None else np.asarray(elevation, dtype=np.float32)
         existing_settings = None
         if isinstance(self.centralWidget(), GlobeViewer):
             existing_settings = self._current_grid_settings()
 
         viewer = GlobeViewer(
-            elevation,
-            cmap="topo",
+            elevation_data,
+            cmap=load_topo_cmap(self._ensure_current_legend(), name=self._legend_name(self._current_legend)),
             responsive=True,
             title=heightfield.stem,
-            mesh=True,
+            mesh=mesh_grid if mesh_grid is not None else True,
             mesh_min_level=self._mesh_min_level,
             mesh_max_level=self._mesh_max_level,
             mesh_threshold=self._mesh_threshold,
@@ -353,19 +665,51 @@ class GlobeMainWindow(QMainWindow):
         self._save_grid_settings()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._load_worker is not None:
+            self._load_worker.cancel()
+        if self._load_thread is not None:
+            self._load_thread.quit()
+            self._load_thread.wait()
         self._save_grid_settings()
         self._settings.sync()
         super().closeEvent(event)
 
+    def _image_file_filter(self) -> str:
+        extensions = sorted({bytes(fmt).decode("ascii").lower() for fmt in QImageReader.supportedImageFormats()})
+        patterns = " ".join(f"*.{extension}" for extension in extensions)
+        return f"Image Files ({patterns});;All Files (*)"
+
+    def _create_open_heightfield_dialog(self) -> QFileDialog:
+        dialog = QFileDialog(self, "Open Heightfield", str(self._heightfield.parent))
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setNameFilter(self._image_file_filter())
+        return dialog
+
     def open_heightfield(self) -> None:
-        file_name, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Heightfield",
-            str(self._heightfield.parent),
-            "Supported Files (*.tif *.tiff *.npy *.npz);;All Files (*)",
-        )
-        if file_name:
-            self._set_heightfield(Path(file_name))
+        dialog = self._create_open_heightfield_dialog()
+        if dialog.exec() != QFileDialog.DialogCode.Accepted:
+            return
+
+        selected_files = dialog.selectedFiles()
+        if not selected_files:
+            return
+
+        heightfield = Path(selected_files[0])
+        progress_dialog = IcosphereProgressDialog(self)
+        self._progress_dialog = progress_dialog
+        progress_dialog.start_stage("loading-heightfield")
+        progress_dialog.show()
+        try:
+            elevation = load_elevation(heightfield)
+        except Exception as exc:
+            progress_dialog.close()
+            progress_dialog.deleteLater()
+            self._progress_dialog = None
+            QMessageBox.critical(self, "Failed to load heightfield", str(exc))
+            return
+        progress_dialog.finish_stage("loading-heightfield")
+        self._start_heightfield_load(heightfield, elevation)
 
     def save_heightfield(self) -> None:
         if self._save_path is None:

@@ -1,3 +1,6 @@
 <RCC>
-    <qresource prefix="/"/>
+    <qresource prefix="/">
+        <file>legends/grayscale.txt</file>
+        <file>legends/topography.txt</file>
+    </qresource>
 </RCC>

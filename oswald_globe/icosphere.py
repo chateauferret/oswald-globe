@@ -38,6 +38,36 @@ _BASE_FACES = (
 )
 
 
+class IcosphereBuildCancelled(Exception):
+    """Raised when adaptive icosphere construction is cancelled."""
+
+
+class _ProgressTracker:
+    def __init__(self, phase: str, total: int, callback: Optional[Callable[[str, int, int], None]]):
+        self.phase = phase
+        self.total = max(1, int(total))
+        self.callback = callback
+        self.done = 0
+        self._last_emitted = -1
+        self._emit_every = max(1, self.total // 512)
+        self._emit()
+
+    def advance(self, amount: int) -> None:
+        self.done = min(self.total, self.done + int(amount))
+        if self.done == self.total or self.done - self._last_emitted >= self._emit_every:
+            self._emit()
+
+    def finish(self) -> None:
+        self.done = self.total
+        self._emit()
+
+    def _emit(self) -> None:
+        if self.callback is None or self.done == self._last_emitted:
+            return
+        self.callback(self.phase, self.done, self.total)
+        self._last_emitted = self.done
+
+
 def _xyz_to_latlon(xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Convert unit-sphere xyz coordinates (..., 3) to (lat_deg, lon_deg)."""
     x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
@@ -96,6 +126,15 @@ class IcosphereGrid:
         self._vertices.append(xyz)
         self._values.append(np.nan)
         return idx
+
+    @staticmethod
+    def _check_cancelled(is_cancelled: Optional[Callable[[], bool]]) -> None:
+        if is_cancelled is not None and is_cancelled():
+            raise IcosphereBuildCancelled()
+
+    @staticmethod
+    def _potential_face_count(level: int, max_level: int) -> int:
+        return 4 ** max(0, max_level - level)
 
     def _midpoint(self, i: int, j: int) -> int:
         key = (i, j) if i < j else (j, i)
@@ -305,9 +344,21 @@ class IcosphereGrid:
             grad = np.where(half_angles > 1e-9, np.abs(actual - predicted) / half_angles, 0.0)
         return bool(np.any(grad > threshold))
 
-    def _refine_face(self, face: _Face, value_fn, min_level: int, max_level: int, threshold: float) -> _Face:
+    def _refine_face(
+        self,
+        face: _Face,
+        value_fn,
+        min_level: int,
+        max_level: int,
+        threshold: float,
+        creation_progress: Optional[_ProgressTracker] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> _Face:
+        self._check_cancelled(is_cancelled)
         self._ensure_values(face.v, value_fn)
         if face.level >= max_level:
+            if creation_progress is not None:
+                creation_progress.advance(1)
             return face
         should_subdivide = (
             face.level < min_level
@@ -318,22 +369,68 @@ class IcosphereGrid:
             if face.children is None:
                 self._subdivide(face)
             for k, child in enumerate(face.children):
-                face.children[k] = self._refine_face(child, value_fn, min_level, max_level, threshold)
+                face.children[k] = self._refine_face(
+                    child,
+                    value_fn,
+                    min_level,
+                    max_level,
+                    threshold,
+                    creation_progress=creation_progress,
+                    is_cancelled=is_cancelled,
+                )
+        elif creation_progress is not None:
+            creation_progress.advance(self._potential_face_count(face.level, max_level))
         return face
 
-    def refine_adaptive(self, value_fn, min_level: int = 4, max_level: int = 10, threshold: float = 50.0):
+    def refine_adaptive(
+        self,
+        value_fn,
+        min_level: int = 4,
+        max_level: int = 10,
+        threshold: float = 50.0,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ):
         """Recursively subdivide faces where `value_fn` varies steeply."""
-        self.roots = [self._refine_face(root, value_fn, min_level, max_level, threshold) for root in self.roots]
+        creation_progress = _ProgressTracker(
+            "creating-faces",
+            len(self.roots) * self._potential_face_count(0, max_level),
+            progress_callback,
+        )
+        self.roots = [
+            self._refine_face(
+                root,
+                value_fn,
+                min_level,
+                max_level,
+                threshold,
+                creation_progress=creation_progress,
+                is_cancelled=is_cancelled,
+            )
+            for root in self.roots
+        ]
+        creation_progress.finish()
         self._invalidate_caches()
-        self._balance(value_fn)
+        self._balance(value_fn, progress_callback=progress_callback, is_cancelled=is_cancelled)
+        self._invalidate_caches()
+        self._populate_face_values(value_fn, progress_callback=progress_callback, is_cancelled=is_cancelled)
         self._invalidate_caches()
 
-    def _balance(self, value_fn):
+    def _balance(
+        self,
+        value_fn,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ):
         """Enforce a 2:1 balance."""
         changed = True
         while changed:
+            self._check_cancelled(is_cancelled)
             changed = False
-            for f in self._red_leaves():
+            leaves = self._red_leaves()
+            balance_progress = _ProgressTracker("balancing-faces", len(leaves), progress_callback)
+            for f in leaves:
+                self._check_cancelled(is_cancelled)
                 v0, v1, v2 = f.v
                 if any(
                     self._far_side_depth(a, b) >= 2
@@ -343,11 +440,32 @@ class IcosphereGrid:
                     for child in f.children:
                         self._ensure_values(child.v, value_fn)
                     changed = True
+                balance_progress.advance(1)
             if changed:
                 self._invalidate_caches()
+            balance_progress.finish()
 
-        for f in self._red_leaves():
+        final_leaves = self._red_leaves()
+        final_balance_progress = _ProgressTracker("balancing-faces", len(final_leaves), progress_callback)
+        for f in final_leaves:
+            self._check_cancelled(is_cancelled)
             self._ensure_values(f.v, value_fn)
+            final_balance_progress.advance(1)
+        final_balance_progress.finish()
+
+    def _populate_face_values(
+        self,
+        value_fn,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        leaves = self.leaf_faces()
+        population_progress = _ProgressTracker("populating-faces", len(leaves), progress_callback)
+        for face in leaves:
+            self._check_cancelled(is_cancelled)
+            self._ensure_values(face.v, value_fn)
+            population_progress.advance(1)
+        population_progress.finish()
 
     def _far_side_depth(self, a: int, b: int) -> int:
         """How many levels deeper edge (a, b) has been subdivided on the far side."""
@@ -364,6 +482,8 @@ class IcosphereGrid:
         min_level: int = 2,
         max_level: int = 8,
         threshold: float = 50.0,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> "IcosphereGrid":
         """Build an adaptive icosphere from a 2D equirectangular raster."""
         grid = cls()
@@ -372,6 +492,8 @@ class IcosphereGrid:
             min_level=min_level,
             max_level=max_level,
             threshold=threshold,
+            progress_callback=progress_callback,
+            is_cancelled=is_cancelled,
         )
         return grid
 

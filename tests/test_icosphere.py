@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from oswald_globe.icosphere import IcosphereGrid, _xyz_to_latlon
+from oswald_globe.icosphere import IcosphereBuildCancelled, IcosphereGrid, _xyz_to_latlon
 
 
 def _bump_map(height=181, width=361):
@@ -108,3 +108,48 @@ def test_dual_graph_matches_faces_and_is_on_unit_sphere():
     assert dual_edges.shape[0] == 3 * grid.face_count() // 2
     assert dual_edges.min() >= 0
     assert dual_edges.max() < grid.face_count()
+
+
+def test_from_equirectangular_reports_creation_and_population_progress():
+    arr = _bump_map(height=91, width=181)
+    progress_updates: list[tuple[str, int, int]] = []
+
+    grid = IcosphereGrid.from_equirectangular(
+        arr,
+        min_level=1,
+        max_level=4,
+        threshold=200.0,
+        progress_callback=lambda phase, done, total: progress_updates.append((phase, done, total)),
+    )
+
+    creation_updates = [update for update in progress_updates if update[0] == "creating-faces"]
+    balance_updates = [update for update in progress_updates if update[0] == "balancing-faces"]
+    population_updates = [update for update in progress_updates if update[0] == "populating-faces"]
+
+    assert creation_updates[0] == ("creating-faces", 0, 20 * 4 ** 4)
+    assert creation_updates[-1] == ("creating-faces", 20 * 4 ** 4, 20 * 4 ** 4)
+    assert balance_updates[0][0] == "balancing-faces"
+    assert balance_updates[0][1] == 0
+    assert balance_updates[-1][1] == balance_updates[-1][2]
+    assert population_updates[0][0] == "populating-faces"
+    assert population_updates[0][1] == 0
+    assert population_updates[-1] == ("populating-faces", grid.face_count(), grid.face_count())
+
+
+def test_from_equirectangular_can_be_cancelled():
+    arr = _bump_map(height=91, width=181)
+    cancelled = {"value": False}
+
+    def on_progress(phase: str, done: int, total: int) -> None:
+        if phase == "creating-faces" and done > 0:
+            cancelled["value"] = True
+
+    with pytest.raises(IcosphereBuildCancelled):
+        IcosphereGrid.from_equirectangular(
+            arr,
+            min_level=1,
+            max_level=6,
+            threshold=200.0,
+            progress_callback=on_progress,
+            is_cancelled=lambda: cancelled["value"],
+        )
