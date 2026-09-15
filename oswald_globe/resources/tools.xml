@@ -1,0 +1,56 @@
+<palette>
+    <tool name="navigate" label="Navigate" icon=":/appicons/controls/globe.png">
+        <cursor type="ArrowCursor"/>
+    </tool>
+    <tool name="level" label="Level" icon=":/appicons/controls/edit.png">
+        <cursor type="BlankCursor"/>
+        <documentation>Level</documentation>
+        <parameters>
+            <scalar name="altitude" label="Altitude" min="-32767" max="32767" units="ft">
+                <documentation>Altitude level</documentation>
+            </scalar>
+            <scalar name="falloff" label="Falloff" min="0" max="100" units="%">
+                <documentation>Radius beyond which falloff begins</documentation>
+            </scalar>
+            <choice type="choice" name="algorithm" label="Algorithm">
+                <option name="replace" label="Replace" documentation="Overwrite the existing value with the new onw"/>
+                <option name="add" label="Add" documentation="Add the new value to the existing one"/>
+                <option name="subtract" label="Subtract" documentation="Subtract the new value from the existing one"/>
+                <option name="minimum" label="Minimum" documentation="Take the new value only if lower than the existing one"/>
+                <option name="maximum" label="Maximum" documentation="Take the new value only if greater than the existing one"/>
+                <option name="multiply" label="Multiply" documentation="Take the product of the existing and the new values"/>
+                <option name="average" label="Average" documentation="Take the average of the existing and the new values"/>
+            </choice>
+        </parameters>
+        <code file=":/shaders/tool_level.glsl"/>
+    </tool>
+    <tool name="noise" label="Noise functions" icon=":/appicons/controls/noise.png">
+        <cursor type="BlankCursor" resize="true"/>
+        <documentation>Noise functions</documentation>
+        <parameters>
+            <parameter type="slider" name="frequency" default="1.0" min="0.0" max="100.0" scale="log" label="Frequency">
+                <documentation>Frequency of the noise function</documentation>
+            </parameter>
+            <parameter mode="float" name="lacunarity" default="2.0" min="0.0" max="10.0" label="Lacunarity">
+                <documentation>Lacunarity of the noise function</documentation>
+            </parameter>
+            <parameter mode="float" name="persistence" default="0.5" min="1" max="30" label="Persistence">
+                <documentation>Persistence of the noise function: reduction of amplitude between octaves</documentation>
+            </parameter>
+            <parameter type="spin" name="octaves" default="4" min="1" max="30" label="Octaves">
+                <documentation>Number of octaves applied of the noise function</documentation>
+            </parameter>
+            <parameter type="integer" name="seed" default="0" min="MIN" max="MAX" label="">
+                <documentation>Random seed</documentation>
+            </parameter>
+            <parameter type="choice" name="algorithm" default="Perlin">
+                <choice name="perlin" label="Perlin noise"/>
+                <choice name="ridged" label="Ridged multifractal"/>
+                <choice name="billowed" label="Billowed perlin"/>
+                <choice name="simplex" label="Simplex noise"/>
+                <documentation>Noise algorithm</documentation>
+            </parameter>
+        </parameters>
+        <code/>
+    </tool>
+</palette>

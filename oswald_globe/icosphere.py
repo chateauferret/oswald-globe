@@ -14,12 +14,22 @@ to rasterize mesh data back onto a regular lat/lon grid.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Set, Tuple
+import sys
+from collections import OrderedDict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from scipy.spatial import cKDTree
 
-from oswald_globe.utils import sample_equirectangular
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+try:
+    from .utils import sample_equirectangular
+except ImportError:  # pragma: no cover - supports running as a script
+    from oswald_globe.utils import sample_equirectangular
 
 _GOLDEN = (1.0 + np.sqrt(5.0)) / 2.0
 
@@ -109,12 +119,58 @@ class _Face:
         return self.children is None
 
 
+@dataclass
+class LayerLegend:
+    """Reference to a render legend: display name + concrete colormap."""
+
+    name: str
+    colormap: Any
+
+    def __post_init__(self) -> None:
+        self.name = str(self.name)
+
+
+@dataclass
+class Layer:
+    """A named data layer attached to each mesh vertex."""
+
+    name: str
+    values: np.ndarray
+    description: str = ""
+    visible: bool = True
+    opacity: float = 100.0
+    legend: Optional[LayerLegend] = None
+    z_index: int = 0
+
+    def __post_init__(self):
+        self.name = str(self.name)
+        self.values = np.asarray(self.values, dtype=np.float64)
+        if self.values.ndim != 1:
+            raise ValueError(f"Layer values for {self.name!r} must be 1D, got shape {self.values.shape}.")
+        self.opacity = float(self.opacity)
+        if self.opacity < 0.0:
+            self.opacity = 0.0
+        elif self.opacity > 100.0:
+            self.opacity = 100.0
+        self.visible = bool(self.visible)
+        self.z_index = int(self.z_index)
+
+    @property
+    def data(self) -> np.ndarray:
+        return self.values
+
+    @data.setter
+    def data(self, values: np.ndarray) -> None:
+        self.values = np.asarray(values, dtype=np.float64)
+
+
 class IcosphereGrid:
     """Adaptive geodesic-sphere mesh for holding global terrain data."""
 
     def __init__(self):
         self._vertices: List[np.ndarray] = [v.copy() for v in _BASE_VERTICES]
-        self._values: List[float] = [np.nan] * len(self._vertices)
+        self._layers: "OrderedDict[str, Layer]" = OrderedDict()
+        self._ensure_layer("elevation", values=np.full(len(self._vertices), np.nan, dtype=np.float64))
         self._edge_midpoints: Dict[Tuple[int, int], int] = {}
         self.roots: List[_Face] = [_Face(f, 0) for f in _BASE_FACES]
 
@@ -123,6 +179,122 @@ class IcosphereGrid:
         self._conforming_cache: Optional[List[_Face]] = None
         self._kdtree: Optional[cKDTree] = None
         self._kdtree_faces: Optional[List[_Face]] = None
+
+    def layer_names(self) -> List[str]:
+        """Return the names of the stored data layers in insertion order."""
+        return list(self._layers.keys())
+
+    @staticmethod
+    def _coerce_legend_reference(legend: Any) -> Optional[LayerLegend]:
+        if legend is None:
+            return None
+        if isinstance(legend, LayerLegend):
+            return legend
+        if isinstance(legend, str):
+            return LayerLegend(name=legend, colormap=None)
+        if isinstance(legend, dict):
+            if "name" not in legend or "colormap" not in legend:
+                raise ValueError("Legend dictionaries must contain both 'name' and 'colormap'.")
+            return LayerLegend(name=legend["name"], colormap=legend["colormap"])
+        if isinstance(legend, tuple) and len(legend) == 2:
+            return LayerLegend(name=legend[0], colormap=legend[1])
+        raise TypeError(
+            "Legend must be LayerLegend, str, dict(name/colormap), tuple(name, colormap), or None."
+        )
+
+    def add_layer(
+        self,
+        name: str,
+        values: Optional[np.ndarray] = None,
+        *,
+        description: str = "",
+        visible: bool = True,
+        opacity: float = 100.0,
+        legend: Any = None,
+        z_index: Optional[int] = None,
+    ) -> Layer:
+        """Create or replace a layer keyed by name, with one value per vertex."""
+        name = str(name)
+        if isinstance(values, Layer):
+            layer = values
+            layer.name = name
+            if description:
+                layer.description = description
+            if visible is not None:
+                layer.visible = bool(visible)
+            if opacity is not None:
+                layer.opacity = float(opacity)
+            if legend is not None:
+                layer.legend = self._coerce_legend_reference(legend)
+            if z_index is not None:
+                layer.z_index = int(z_index)
+            self._layers[name] = layer
+            return layer
+
+        if name in self._layers:
+            layer = self._layers[name]
+            if values is not None:
+                arr = np.asarray(values, dtype=np.float64)
+                if arr.shape[0] != len(self._vertices):
+                    raise ValueError(f"Layer {name!r} must contain one value per vertex ({len(self._vertices)}), got shape {arr.shape}.")
+                layer.values = arr
+            if description:
+                layer.description = description
+            layer.visible = bool(visible)
+            layer.opacity = float(opacity)
+            if legend is not None:
+                layer.legend = self._coerce_legend_reference(legend)
+            if z_index is not None:
+                layer.z_index = int(z_index)
+            return layer
+
+        if values is None:
+            values = np.full(len(self._vertices), np.nan, dtype=np.float64)
+        arr = np.asarray(values, dtype=np.float64)
+        if arr.shape[0] != len(self._vertices):
+            raise ValueError(f"Layer {name!r} must contain one value per vertex ({len(self._vertices)}), got shape {arr.shape}.")
+        layer = Layer(
+            name=name,
+            values=arr,
+            description=description,
+            visible=visible,
+            opacity=opacity,
+            legend=self._coerce_legend_reference(legend),
+            z_index=len(self._layers) if z_index is None else int(z_index),
+        )
+        self._layers[name] = layer
+        return layer
+
+    def _ensure_layer(self, name: str, *, values: Optional[np.ndarray] = None, **kwargs: Any) -> Layer:
+        """Ensure a layer exists and matches the current vertex count."""
+        if name not in self._layers:
+            return self.add_layer(name, values, **kwargs)
+
+        layer = self._layers[name]
+        if layer.values.shape[0] != len(self._vertices):
+            padded = np.full(len(self._vertices), np.nan, dtype=np.float64)
+            copy_count = min(layer.values.shape[0], len(self._vertices))
+            if copy_count:
+                padded[:copy_count] = layer.values[:copy_count]
+            layer.values = padded
+        return layer
+
+    def get_layer(self, name: str) -> Layer:
+        """Return the named layer object."""
+        return self._ensure_layer(name)
+
+    def set_layer(self, name: str, values: np.ndarray, **kwargs: Any) -> Layer:
+        """Set a named data layer for all vertices."""
+        return self.add_layer(name, values, **kwargs)
+
+    @property
+    def _values(self) -> np.ndarray:
+        """Backward-compatible access to the elevation layer."""
+        return self.get_layer("elevation").values
+
+    @_values.setter
+    def _values(self, values: np.ndarray) -> None:
+        self.set_layer("elevation", values)
 
     def _invalidate_caches(self):
         self._vertices_arr_cache = None
@@ -134,7 +306,9 @@ class IcosphereGrid:
     def _add_vertex(self, xyz: np.ndarray) -> int:
         idx = len(self._vertices)
         self._vertices.append(xyz)
-        self._values.append(np.nan)
+        for layer_name in self.layer_names():
+            layer = self._layers[layer_name]
+            layer.values = np.append(layer.values, np.nan)
         return idx
 
     @staticmethod
@@ -185,7 +359,7 @@ class IcosphereGrid:
 
     @property
     def values(self) -> np.ndarray:
-        """Data value assigned to every vertex, shape (N,)."""
+        """Elevation data assigned to every vertex, shape (N,)."""
         return np.array(self._values)
 
     def vertex_lat_lon(self) -> Tuple[np.ndarray, np.ndarray]:

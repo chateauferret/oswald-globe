@@ -10,12 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from oswald_globe.app import (  # noqa: E402
-    DEFAULT_HEIGHTFIELD,
-    create_window,
-    load_elevation,
-    main,
-)
+import oswald_globe.app
 
 if __name__ == "__main__":
-    main()
+    oswald_globe.app.main()

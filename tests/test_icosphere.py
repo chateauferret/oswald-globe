@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from oswald_globe.icosphere import IcosphereBuildCancelled, IcosphereGrid, _xyz_to_latlon
+from oswald_globe.icosphere import IcosphereBuildCancelled, IcosphereGrid, LayerLegend, _xyz_to_latlon
 
 
 def _bump_map(height=181, width=361):
@@ -70,6 +70,39 @@ def test_sample_matches_vertex_values_at_vertices():
 
     sampled = grid.sample(lat, lon)
     assert np.allclose(sampled, np.arange(grid.vertex_count()), atol=1e-6)
+
+
+def test_layers_support_metadata_and_ordered_storage():
+    grid = IcosphereGrid()
+    elevation = grid.get_layer("elevation")
+    elevation.description = "Terrain height"
+    elevation.opacity = 65.0
+    elevation.legend = LayerLegend(name="topo", colormap=object())
+    elevation.visible = True
+
+    thermal_cmap = object()
+    temp = grid.add_layer(
+        "temperature",
+        np.full(grid.vertex_count(), 12.0, dtype=np.float64),
+        description="Surface temperature",
+        opacity=80.0,
+        legend=LayerLegend(name="thermal", colormap=thermal_cmap),
+        z_index=5,
+    )
+
+    assert grid.layer_names() == ["elevation", "temperature"]
+    assert elevation.name == "elevation"
+    assert elevation.description == "Terrain height"
+    assert elevation.opacity == 65.0
+    assert elevation.legend is not None
+    assert elevation.legend.name == "topo"
+    assert temp.name == "temperature"
+    assert temp.description == "Surface temperature"
+    assert temp.opacity == 80.0
+    assert temp.legend is not None
+    assert temp.legend.name == "thermal"
+    assert temp.legend.colormap is thermal_cmap
+    assert temp.z_index == 5
 
 
 def test_adaptive_refinement_is_2_1_balanced():

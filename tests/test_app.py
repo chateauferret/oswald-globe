@@ -5,9 +5,9 @@ import sys
 import numpy as np
 from PIL import Image
 import pytest
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QFileDialog
+from PySide6.QtWidgets import QComboBox, QFileDialog, QSlider
 
 from oswald_globe.app import IcosphereProgressDialog, create_window, load_elevation
 from oswald_globe.icosphere import IcosphereGrid
@@ -77,14 +77,20 @@ def test_create_window(qapp, tmp_path: Path):
     assert window is not None
     assert window.windowTitle() == "globe"
     assert window.centralWidget() is not None
-    assert [action.text() for action in window.menuBar().actions()] == ["File", "Edit", "View"]
-    assert [action.text() for action in window.menuBar().actions()[0].menu().actions() if action.text()] == [
+    assert [action.text() for action in window.menuBar().actions()] == ["File", "Edit", "Tools", "View"]
+    assert window._file_menu is not None
+    assert [action.text() for action in window._file_menu.actions() if action.text()] == [
         "Open",
         "Save",
         "Save As...",
         "Settings",
     ]
-    legend_menu = window.menuBar().actions()[2].menu().actions()[0].menu()
+    assert window._tools_menu is not None
+    assert [action.text() for action in window._tools_menu.actions()] == ["Navigate", "Paint"]
+    assert [action.text() for action in window._tools_menu.actions() if action.isChecked()] == ["Navigate"]
+
+    assert window._legend_menu is not None
+    legend_menu = window._legend_menu
     window._populate_legend_menu()
     assert [action.text() for action in legend_menu.actions()] == ["grayscale", "topography"]
     assert [action.text() for action in legend_menu.actions() if action.isChecked()] == ["topography"]
@@ -121,7 +127,8 @@ def test_create_window(qapp, tmp_path: Path):
     )
     restored_viewer = restored_window.centralWidget()
     restored_window._populate_legend_menu()
-    restored_legend_menu = restored_window.menuBar().actions()[2].menu().actions()[0].menu()
+    assert restored_window._legend_menu is not None
+    restored_legend_menu = restored_window._legend_menu
     assert restored_viewer.cmap.name == "grayscale"
     assert [action.text() for action in restored_legend_menu.actions() if action.isChecked()] == ["grayscale"]
     assert restored_viewer.gl_widget.show_wireframe is False
@@ -131,6 +138,68 @@ def test_create_window(qapp, tmp_path: Path):
     assert restored_viewer.gl_widget.graticule_color == (0.0, 1.0, 0.0)
     assert restored_viewer.gl_widget.graticule_opacity == 0.75
     restored_window.close()
+
+
+def test_paint_tool_selection_shows_options_and_navigate_disposes(qapp):
+    window = create_window()
+    try:
+        assert window._tools_menu is not None
+        tools_menu = window._tools_menu
+        navigate_action, paint_action = tools_menu.actions()
+        paint_tool = window._tools["paint"]
+
+        assert navigate_action.isChecked() is True
+        assert paint_action.isChecked() is False
+        assert paint_tool.options_dialog is None
+
+        paint_action.trigger()
+        assert paint_action.isChecked() is True
+        assert navigate_action.isChecked() is False
+        assert paint_tool.options_dialog is not None
+        assert paint_tool.options_dialog.windowTitle() == "Paint Tool Options"
+        assert bool(paint_tool.options_dialog.windowFlags() & Qt.WindowType.Tool) is True
+        assert bool(paint_tool.options_dialog.windowFlags() & Qt.WindowType.WindowStaysOnTopHint) is True
+
+        sliders = paint_tool.options_dialog.findChildren(QSlider)
+        ranges = sorted((slider.minimum(), slider.maximum()) for slider in sliders)
+        assert ranges == [(0, 100), (0, 100), (0, 1000)]
+        mode_combo = paint_tool.options_dialog.findChild(QComboBox)
+        assert mode_combo is not None
+        assert [mode_combo.itemText(i) for i in range(mode_combo.count())] == [
+            "Replace",
+            "Add",
+            "Subtract",
+            "Minimum",
+            "Maximum",
+            "Multiply",
+            "Average",
+        ]
+        assert paint_tool.value() == 50
+        assert paint_tool.mode() == "Replace"
+        assert paint_tool.radius_km() == 100
+        assert paint_tool.falloff_percent() == 50
+        paint_tool.options_dialog.value_slider.setValue(73)
+        mode_combo.setCurrentText("Multiply")
+        paint_tool.options_dialog.radius_slider.setValue(444)
+        paint_tool.options_dialog.falloff_slider.setValue(11)
+
+        navigate_action.trigger()
+        assert navigate_action.isChecked() is True
+        assert paint_action.isChecked() is False
+        assert paint_tool.options_dialog is None
+        assert paint_tool.value() == 73
+        assert paint_tool.mode() == "Multiply"
+        assert paint_tool.radius_km() == 444
+        assert paint_tool.falloff_percent() == 11
+
+        paint_action.trigger()
+        assert paint_tool.options_dialog is not None
+        assert paint_tool.options_dialog.value_slider.value() == 73
+        assert paint_tool.options_dialog.mode_combo.currentText() == "Multiply"
+        assert paint_tool.options_dialog.radius_slider.value() == 444
+        assert paint_tool.options_dialog.falloff_slider.value() == 11
+    finally:
+        window.close()
 
 
 def test_open_heightfield_dialog_configuration(qapp, tmp_path: Path):

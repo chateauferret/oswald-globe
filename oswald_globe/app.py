@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from abc import ABC, abstractmethod
 from threading import Event
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple, Union
@@ -14,6 +15,7 @@ from PySide6.QtCore import QDir, QObject, QSettings, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QImageReader, QSurfaceFormat
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QCheckBox,
@@ -24,9 +26,11 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSlider,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -219,6 +223,181 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+class PaintToolOptionsDialog(QDialog):
+    _PAINT_MODES = ("Replace", "Add", "Subtract", "Minimum", "Maximum", "Multiply", "Average")
+
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        *,
+        value: int = 50,
+        mode: str = "Replace",
+        radius_km: int = 100,
+        falloff_percent: int = 50,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Paint Tool Options")
+        self.setWindowFlag(Qt.WindowType.Tool, True)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setModal(False)
+        self.resize(360, 220)
+
+        layout = QGridLayout(self)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(8)
+
+        self.value_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.value_slider.setRange(0, 100)
+        self.value_slider.setValue(int(value))
+
+        self.mode_combo = QComboBox(self)
+        self.mode_combo.addItems(list(self._PAINT_MODES))
+        self.mode_combo.setCurrentText(mode if mode in self._PAINT_MODES else self._PAINT_MODES[0])
+
+        self.radius_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.radius_slider.setRange(0, 1000)
+        self.radius_slider.setValue(int(radius_km))
+
+        self.falloff_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.falloff_slider.setRange(0, 100)
+        self.falloff_slider.setValue(int(falloff_percent))
+
+        layout.addWidget(QLabel("Value"), 0, 0)
+        layout.addWidget(self.value_slider, 0, 1)
+        layout.addWidget(QLabel("Mode"), 1, 0)
+        layout.addWidget(self.mode_combo, 1, 1)
+        layout.addWidget(QLabel("Radius (km)"), 2, 0)
+        layout.addWidget(self.radius_slider, 2, 1)
+        layout.addWidget(QLabel("Falloff (%)"), 3, 0)
+        layout.addWidget(self.falloff_slider, 3, 1)
+
+
+class Tool(ABC):
+    def __init__(self, parent: QWidget):
+        self._parent = parent
+        self._menu_action: Optional[QAction] = None
+        self._options_dialog: Optional[QDialog] = None
+
+    @property
+    def menu_action(self) -> Optional[QAction]:
+        return self._menu_action
+
+    @property
+    def options_dialog(self) -> Optional[QDialog]:
+        return self._options_dialog
+
+    @abstractmethod
+    def create_menu_action(
+        self,
+        tools_menu: QMenu,
+        action_group: QActionGroup,
+        on_selected: Callable[[], None],
+    ) -> QAction:
+        raise NotImplementedError
+
+    def create_options_dialog(self) -> Optional[QDialog]:
+        return None
+
+    def show_options_dialog(self) -> None:
+        if self._options_dialog is None:
+            self._options_dialog = self.create_options_dialog()
+            if self._options_dialog is not None:
+                self._options_dialog.destroyed.connect(self._on_options_dialog_destroyed)
+        if self._options_dialog is None:
+            return
+        self._options_dialog.show()
+        self._options_dialog.raise_()
+        self._options_dialog.activateWindow()
+
+    @Slot()
+    def _on_options_dialog_destroyed(self) -> None:
+        self._options_dialog = None
+
+    def dispose_options_dialog(self) -> None:
+        if self._options_dialog is None:
+            return
+        dialog = self._options_dialog
+        self._options_dialog = None
+        dialog.close()
+        dialog.deleteLater()
+
+
+class NavigateTool(Tool):
+    def create_menu_action(
+        self,
+        tools_menu: QMenu,
+        action_group: QActionGroup,
+        on_selected: Callable[[], None],
+    ) -> QAction:
+        action = QAction("Navigate", self._parent)
+        action.setCheckable(True)
+        action.triggered.connect(lambda checked=False: on_selected())
+        tools_menu.addAction(action)
+        action_group.addAction(action)
+        self._menu_action = action
+        return action
+
+
+class PaintTool(Tool):
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self._value = 50
+        self._mode = "Replace"
+        self._radius_km = 100
+        self._falloff_percent = 50
+
+    def create_menu_action(
+        self,
+        tools_menu: QMenu,
+        action_group: QActionGroup,
+        on_selected: Callable[[], None],
+    ) -> QAction:
+        action = QAction("Paint", self._parent)
+        action.setCheckable(True)
+        action.triggered.connect(lambda checked=False: on_selected())
+        tools_menu.addAction(action)
+        action_group.addAction(action)
+        self._menu_action = action
+        return action
+
+    def create_options_dialog(self) -> Optional[QDialog]:
+        return PaintToolOptionsDialog(
+            self._parent,
+            value=self._value,
+            mode=self._mode,
+            radius_km=self._radius_km,
+            falloff_percent=self._falloff_percent,
+        )
+
+    def dispose_options_dialog(self) -> None:
+        if isinstance(self._options_dialog, PaintToolOptionsDialog):
+            self._value = int(self._options_dialog.value_slider.value())
+            self._mode = str(self._options_dialog.mode_combo.currentText())
+            self._radius_km = int(self._options_dialog.radius_slider.value())
+            self._falloff_percent = int(self._options_dialog.falloff_slider.value())
+        super().dispose_options_dialog()
+
+    def value(self) -> int:
+        if isinstance(self._options_dialog, PaintToolOptionsDialog):
+            return int(self._options_dialog.value_slider.value())
+        return self._value
+
+    def mode(self) -> str:
+        if isinstance(self._options_dialog, PaintToolOptionsDialog):
+            return str(self._options_dialog.mode_combo.currentText())
+        return self._mode
+
+    def radius_km(self) -> int:
+        if isinstance(self._options_dialog, PaintToolOptionsDialog):
+            return int(self._options_dialog.radius_slider.value())
+        return self._radius_km
+
+    def falloff_percent(self) -> int:
+        if isinstance(self._options_dialog, PaintToolOptionsDialog):
+            return int(self._options_dialog.falloff_slider.value())
+        return self._falloff_percent
+
+
 class IcosphereProgressDialog(QDialog):
     cancelRequested = Signal()
     _STAGES = (
@@ -370,6 +549,15 @@ class GlobeMainWindow(QMainWindow):
         self._save_path: Optional[Path] = None
         self._settings = settings or APP_SETTINGS
         self._legend_action_group: Optional[QActionGroup] = None
+        self._tool_action_group: Optional[QActionGroup] = None
+        self._tools: Dict[str, Tool] = {
+            "navigate": NavigateTool(self),
+            "paint": PaintTool(self),
+        }
+        self._active_tool: Optional[Tool] = None
+        self._file_menu: Optional[QMenu] = None
+        self._tools_menu: Optional[QMenu] = None
+        self._view_menu: Optional[QMenu] = None
         self._current_legend = self._load_current_legend()
         self._load_thread: Optional[QThread] = None
         self._load_worker: Optional[IcosphereBuildWorker] = None
@@ -389,31 +577,62 @@ class GlobeMainWindow(QMainWindow):
         return self.centralWidget()  # type: ignore[return-value]
 
     def _build_menu_bar(self) -> None:
-        file_menu = self.menuBar().addMenu("File")
+        self._file_menu = self.menuBar().addMenu("File")
 
         open_action = QAction("Open", self)
         open_action.triggered.connect(self.open_heightfield)
-        file_menu.addAction(open_action)
+        self._file_menu.addAction(open_action)
 
         save_action = QAction("Save", self)
         save_action.triggered.connect(self.save_heightfield)
-        file_menu.addAction(save_action)
+        self._file_menu.addAction(save_action)
 
         save_as_action = QAction("Save As...", self)
         save_as_action.triggered.connect(self.save_heightfield_as)
-        file_menu.addAction(save_as_action)
+        self._file_menu.addAction(save_as_action)
 
-        file_menu.addSeparator()
+        self._file_menu.addSeparator()
 
         settings_action = QAction("Settings", self)
         settings_action.triggered.connect(self.open_settings)
-        file_menu.addAction(settings_action)
+        self._file_menu.addAction(settings_action)
 
         self.menuBar().addMenu("Edit")
 
-        view_menu = self.menuBar().addMenu("View")
-        self._legend_menu = view_menu.addMenu("Legend")
+        self._tools_menu = self.menuBar().addMenu("Tools")
+        self._tool_action_group = QActionGroup(self._tools_menu)
+        self._tool_action_group.setExclusive(True)
+
+        self._tools["navigate"].create_menu_action(
+            self._tools_menu,
+            self._tool_action_group,
+            on_selected=lambda: self._set_active_tool("navigate"),
+        )
+
+        self._tools["paint"].create_menu_action(
+            self._tools_menu,
+            self._tool_action_group,
+            on_selected=lambda: self._set_active_tool("paint"),
+        )
+
+        if self._tools["navigate"].menu_action is None:
+            raise RuntimeError("Navigate tool menu action was not created.")
+        self._tools["navigate"].menu_action.setChecked(True)
+        self._set_active_tool("navigate")
+
+        self._view_menu = self.menuBar().addMenu("View")
+        self._legend_menu = self._view_menu.addMenu("Legend")
         self._legend_menu.aboutToShow.connect(self._populate_legend_menu)
+
+    def _set_active_tool(self, tool_name: str) -> None:
+        next_tool = self._tools.get(tool_name)
+        if next_tool is None:
+            raise ValueError(f"Unknown tool selection: {tool_name}")
+
+        if self._active_tool is not None and self._active_tool is not next_tool:
+            self._active_tool.dispose_options_dialog()
+        self._active_tool = next_tool
+        self._active_tool.show_options_dialog()
 
     def _legend_name(self, legend_source: Union[str, Path]) -> str:
         return Path(str(legend_source).removeprefix(":/")).stem
@@ -717,6 +936,8 @@ class GlobeMainWindow(QMainWindow):
         self._save_grid_settings()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        for tool in self._tools.values():
+            tool.dispose_options_dialog()
         if self._load_worker is not None:
             self._load_worker.cancel()
         if self._load_thread is not None:
