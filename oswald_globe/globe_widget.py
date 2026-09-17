@@ -157,6 +157,15 @@ class GlobeGLWidget(QOpenGLWidget):
         self.vel_x = 0.0
         self.vel_y = 0.0
 
+        # Active tool state ("navigate" or "paint") and paint brush preview parameters.
+        self.tool_mode = "navigate"
+        self.paint_angular_radius = math.radians(5.0)
+        self.paint_dropoff_percent = 50.0
+        self._mouse_pos: Optional[QPoint] = None
+        self._mouse_over_globe = False
+        self._hover_target_lat = 0.0
+        self._hover_target_lon = 0.0
+
         # Downsample data grid for tooltips and texture if needed
         self.data_grid = self._prepare_grid_data(self.raw_data)
 
@@ -176,6 +185,8 @@ class GlobeGLWidget(QOpenGLWidget):
 
         self.index_count = 0
         self.dual_line_count = 0
+        self.brush_vbo = 0
+        self.brush_vertex_count = 0
         self._gl_initialized = False
         self._first_frame_rendered = False
 
@@ -546,6 +557,48 @@ class GlobeGLWidget(QOpenGLWidget):
             ch = self.controls_widget.height()
             self.controls_widget.move(w - cw - 10, h - ch - 10)
 
+    # ---------------- Tool Mode & Paint Brush Preview ----------------
+
+    def set_tool_mode(self, mode: str) -> None:
+        """Switch the active interaction tool ("navigate" or "paint")."""
+        mode = mode if mode in ("navigate", "paint") else "navigate"
+        if mode == self.tool_mode:
+            return
+        self.tool_mode = mode
+        self.is_dragging = False
+        self._refresh_cursor()
+        self.update()
+
+    def set_paint_brush(self, width_deg: float, dropoff_percent: float) -> None:
+        """Update the paint brush preview angular width (degrees) and dropoff percentage.
+
+        The brush is defined in geographic terms (degrees of arc) rather than
+        screen pixels, so it scales with the globe as the view is zoomed,
+        just like the graticule.
+        """
+        # Cap at just under a hemisphere so large values stay a valid small circle.
+        radius_deg = min(89.0, max(0.0, float(width_deg)) / 2.0)
+        self.paint_angular_radius = math.radians(radius_deg)
+        self.paint_dropoff_percent = min(100.0, max(0.0, float(dropoff_percent)))
+        if self.tool_mode == "paint":
+            self.update()
+
+    def _refresh_cursor(self) -> None:
+        if self.tool_mode == "paint":
+            if self._mouse_over_globe:
+                self.setCursor(Qt.CursorShape.BlankCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ForbiddenCursor)
+            return
+
+        # Navigate tool.
+        if self._mouse_over_globe:
+            self.setCursor(
+                Qt.CursorShape.ClosedHandCursor if self.is_dragging else Qt.CursorShape.OpenHandCursor
+            )
+        else:
+            self.setCursor(Qt.CursorShape.ForbiddenCursor)
+
     def paintGL(self):
         if not self._gl_initialized or self.program <= 0 or self.line_program <= 0:
             return
@@ -683,6 +736,82 @@ class GlobeGLWidget(QOpenGLWidget):
             self._first_frame_rendered = True
             self.firstFrameRendered.emit()
 
+        self._draw_brush_overlay(p_matrix, mv_matrix)
+
+    def _brush_ring_vertices(self, angular_radius: float, segments: int = 128) -> np.ndarray:
+        """Build object-space line-loop vertices for a small circle of the given
+        angular radius (radians) centred on the currently hovered globe point.
+
+        Coordinates use the same object-space convention as the globe mesh, so
+        the ring can be transformed by the regular model-view/projection
+        matrices and therefore scales with the globe as the view is zoomed.
+        """
+        center_lat = self._hover_target_lat
+        center_lon = self._hover_target_lon
+
+        cos_lat = math.cos(center_lat)
+        sin_lat = math.sin(center_lat)
+        cos_lon = math.cos(center_lon)
+        sin_lon = math.sin(center_lon)
+
+        # Orthonormal basis tangent to the sphere at the hovered point.
+        center_vec = np.array([cos_lat * sin_lon, sin_lat, cos_lat * cos_lon], dtype=np.float64)
+        east_vec = np.array([cos_lon, 0.0, -sin_lon], dtype=np.float64)
+        north_vec = np.array([-sin_lat * sin_lon, cos_lat, -sin_lat * cos_lon], dtype=np.float64)
+
+        theta = np.linspace(0.0, 2.0 * math.pi, segments, endpoint=False)
+        sin_r = math.sin(angular_radius)
+        cos_r = math.cos(angular_radius)
+
+        offsets_e = (sin_r * np.cos(theta))[:, None] * east_vec[None, :]
+        offsets_n = (sin_r * np.sin(theta))[:, None] * north_vec[None, :]
+        ring = cos_r * center_vec[None, :] + offsets_e + offsets_n
+
+        # Lift slightly off the surface so the ring is not z-fought by the globe.
+        ring *= 1.002
+
+        # Expand the closed loop into GL_LINES pairs.
+        pairs = np.empty((segments * 2, 3), dtype=np.float32)
+        pairs[0::2] = ring
+        pairs[1::2] = np.roll(ring, -1, axis=0)
+        return np.ascontiguousarray(pairs, dtype=np.float32)
+
+    def _draw_brush_overlay(self, p_matrix, mv_matrix) -> None:
+        """Draw the paint brush preview circles on the surface of the globe."""
+        if self.tool_mode != "paint" or not self._mouse_over_globe:
+            return
+        if self.paint_angular_radius <= 0 or self.line_program <= 0:
+            return
+
+        inner_radius = self.paint_angular_radius * (self.paint_dropoff_percent / 100.0)
+        rings = [self.paint_angular_radius]
+        if inner_radius > 0:
+            rings.append(inner_radius)
+
+        vertices = np.concatenate([self._brush_ring_vertices(r) for r in rings], axis=0)
+
+        if self.brush_vbo == 0:
+            self.brush_vbo = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.brush_vbo)
+        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_DYNAMIC_DRAW)
+        self.brush_vertex_count = len(vertices)
+
+        glUseProgram(self.line_program)
+        glUniformMatrix4fv(glGetUniformLocation(self.line_program, "uPMatrix"), 1, GL_FALSE, p_matrix)
+        glUniformMatrix4fv(glGetUniformLocation(self.line_program, "uMVMatrix"), 1, GL_FALSE, mv_matrix)
+        glUniform3f(glGetUniformLocation(self.line_program, "uWireframeColor"), 1.0, 1.0, 1.0)
+        glUniform1f(glGetUniformLocation(self.line_program, "uWireframeOpacity"), 1.0)
+
+        a_position = glGetAttribLocation(self.line_program, "aPosition")
+        if a_position >= 0:
+            glEnableVertexAttribArray(a_position)
+            raw_glVertexAttribPointer(a_position, 3, GL_FLOAT, GL_FALSE, 0, None)
+
+        glLineWidth(1.0)
+        glDepthMask(GL_FALSE)
+        glDrawArrays(GL_LINES, 0, self.brush_vertex_count)
+        glDepthMask(GL_TRUE)
+
     # ---------------- Mouse & Animation Handlers ----------------
 
     def _on_anim_tick(self):
@@ -705,8 +834,9 @@ class GlobeGLWidget(QOpenGLWidget):
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.is_dragging = True
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            if self.tool_mode == "navigate":
+                self.is_dragging = True
+                self._refresh_cursor()
             QToolTip.hideText()
             self.last_mouse_x = event.position().x()
             self.last_mouse_y = event.position().y()
@@ -716,6 +846,18 @@ class GlobeGLWidget(QOpenGLWidget):
     def mouseMoveEvent(self, event: QMouseEvent):
         x = event.position().x()
         y = event.position().y()
+        self._mouse_pos = event.position().toPoint()
+
+        pt = unproject_point(
+            x, y, self.width(), self.height(), self.zoom, self.center_lat, self.center_lon, self.data_grid
+        )
+        was_over_globe = self._mouse_over_globe
+        self._mouse_over_globe = pt is not None
+        if pt is not None:
+            self._hover_target_lat = pt["target_lat"]
+            self._hover_target_lon = pt["target_lon"]
+        if was_over_globe != self._mouse_over_globe:
+            self._refresh_cursor()
 
         if self.is_dragging:
             dx = x - self.last_mouse_x
@@ -734,11 +876,13 @@ class GlobeGLWidget(QOpenGLWidget):
             self.update()
         else:
             self._update_tooltip(x, y)
+            if self.tool_mode == "paint":
+                self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton and self.is_dragging:
             self.is_dragging = False
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self._refresh_cursor()
             self._emit_center()
             self.update()
 
@@ -768,7 +912,11 @@ class GlobeGLWidget(QOpenGLWidget):
 
     def leaveEvent(self, event):
         QToolTip.hideText()
+        self._mouse_pos = None
+        self._mouse_over_globe = False
         super().leaveEvent(event)
+        if self.tool_mode == "paint":
+            self.update()
 
     def _update_tooltip(self, client_x: float, client_y: float):
         if self.is_dragging:

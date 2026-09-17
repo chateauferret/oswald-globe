@@ -361,13 +361,21 @@ class PaintTool(Tool):
         return action
 
     def create_options_dialog(self) -> Optional[QDialog]:
-        return PaintToolOptionsDialog(
+        dialog = PaintToolOptionsDialog(
             self._parent,
             value=self._value,
             mode=self._mode,
             radius_km=self._radius_km,
             falloff_percent=self._falloff_percent,
         )
+        dialog.radius_slider.valueChanged.connect(self._notify_brush_changed)
+        dialog.falloff_slider.valueChanged.connect(self._notify_brush_changed)
+        return dialog
+
+    def _notify_brush_changed(self, _value: int) -> None:
+        sync = getattr(self._parent, "_sync_tool_mode_to_viewer", None)
+        if callable(sync):
+            sync()
 
     def dispose_options_dialog(self) -> None:
         if isinstance(self._options_dialog, PaintToolOptionsDialog):
@@ -555,6 +563,7 @@ class GlobeMainWindow(QMainWindow):
             "paint": PaintTool(self),
         }
         self._active_tool: Optional[Tool] = None
+        self._active_tool_name: Optional[str] = None
         self._file_menu: Optional[QMenu] = None
         self._tools_menu: Optional[QMenu] = None
         self._view_menu: Optional[QMenu] = None
@@ -632,7 +641,18 @@ class GlobeMainWindow(QMainWindow):
         if self._active_tool is not None and self._active_tool is not next_tool:
             self._active_tool.dispose_options_dialog()
         self._active_tool = next_tool
+        self._active_tool_name = tool_name
         self._active_tool.show_options_dialog()
+        self._sync_tool_mode_to_viewer()
+
+    def _sync_tool_mode_to_viewer(self) -> None:
+        gl_widget = getattr(self.viewer, "gl_widget", None)
+        if gl_widget is None:
+            return
+        gl_widget.set_tool_mode(self._active_tool_name or "navigate")
+        paint_tool = self._tools.get("paint")
+        if isinstance(paint_tool, PaintTool):
+            gl_widget.set_paint_brush(paint_tool.radius_km(), paint_tool.falloff_percent())
 
     def _legend_name(self, legend_source: Union[str, Path]) -> str:
         return Path(str(legend_source).removeprefix(":/")).stem
@@ -825,6 +845,7 @@ class GlobeMainWindow(QMainWindow):
             self.setWindowTitle(view_title)
             self._heightfield = None
             self._save_path = None
+            self._sync_tool_mode_to_viewer()
             return
 
         heightfield = Path(heightfield).expanduser().resolve()
@@ -856,6 +877,7 @@ class GlobeMainWindow(QMainWindow):
         self.setWindowTitle(heightfield.stem)
         self._heightfield = heightfield
         self._save_path = None
+        self._sync_tool_mode_to_viewer()
 
     def _current_grid_settings(self) -> Dict[str, Dict[str, Union[bool, float, QColor]]]:
         viewer = self.viewer
