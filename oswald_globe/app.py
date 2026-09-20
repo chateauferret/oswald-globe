@@ -1074,7 +1074,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Interactive 3D heightfield desktop globe.")
     parser.add_argument("--heightfield", type=Path, default=None, help="Optional raster file to load. Defaults to a sea-level globe.")
     parser.add_argument("--mesh-min-level", type=int, default=2, help="Minimum icosphere subdivision level.")
-    parser.add_argument("--mesh-max-level", type=int, default=7, help="Maximum icosphere subdivision level.")
+    parser.add_argument("--mesh-max-level", type=int, default=6, help="Maximum icosphere subdivision level.")
     parser.add_argument("--mesh-threshold", type=float, default=100.0, help="Gradient threshold driving adaptive refinement.")
     parser.add_argument("--width", type=int, default=850, help="Window width in pixels.")
     parser.add_argument("--height", type=int, default=900, help="Window height in pixels.")

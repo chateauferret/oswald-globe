@@ -14,21 +14,36 @@ Desktop interactive 3D virtual globe application built with **PySide6 (Qt)** and
 
 ## Installation
 
-Install dependencies:
+The `run.sh` script creates the local `.venv` when needed, installs the
+dependencies from `requirements.txt`, activates the environment, and starts
+the application:
+
 ```bash
-pip install -r requirements.txt
+./run.sh
 ```
+
+Dependencies are checked against `requirements.txt` on each start and are
+refreshed automatically when that file changes. To set up the environment
+without starting the application, run:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+Startup output is also appended to `.logs/launch.log`, which is useful when
+the terminal's scrollback does not show the complete traceback.
 
 ## Running the Application
 
 Launch the default sea-level globe:
 ```bash
-python app.py
+./run.sh
 ```
 
 Or load a custom heightfield raster:
 ```bash
-python app.py --heightfield path/to/heightfield.tif --mesh-min-level 2 --mesh-max-level 7 --mesh-threshold 100.0
+./run.sh --heightfield path/to/heightfield.tif --mesh-min-level 2 --mesh-max-level 7 --mesh-threshold 100.0
 ```
 
 ## Running Tests

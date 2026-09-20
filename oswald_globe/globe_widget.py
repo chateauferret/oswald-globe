@@ -7,7 +7,87 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
-from OpenGL.GL import *
+from OpenGL.GL import (
+    GL_ARRAY_BUFFER,
+    GL_BACK,
+    GL_BLEND,
+    GL_CLAMP_TO_EDGE,
+    GL_COLOR_BUFFER_BIT,
+    GL_COMPILE_STATUS,
+    GL_CULL_FACE,
+    GL_DEPTH_BUFFER_BIT,
+    GL_DEPTH_TEST,
+    GL_DYNAMIC_DRAW,
+    GL_ELEMENT_ARRAY_BUFFER,
+    GL_FALSE,
+    GL_FLOAT,
+    GL_FRAGMENT_SHADER,
+    GL_LEQUAL,
+    GL_LESS,
+    GL_LINEAR,
+    GL_LINES,
+    GL_LINK_STATUS,
+    GL_ONE_MINUS_SRC_ALPHA,
+    GL_REPEAT,
+    GL_RGB,
+    GL_SRC_ALPHA,
+    GL_STATIC_DRAW,
+    GL_TEXTURE0,
+    GL_TEXTURE1,
+    GL_TEXTURE_2D,
+    GL_TEXTURE_MAG_FILTER,
+    GL_TEXTURE_MIN_FILTER,
+    GL_TEXTURE_WRAP_S,
+    GL_TEXTURE_WRAP_T,
+    GL_TRIANGLES,
+    GL_TRUE,
+    GL_UNPACK_ALIGNMENT,
+    GL_UNSIGNED_BYTE,
+    GL_UNSIGNED_INT,
+    GL_VERTEX_SHADER,
+    glActiveTexture,
+    glAttachShader,
+    glBindBuffer,
+    glBindTexture,
+    glBlendFunc,
+    glBufferData,
+    glClear,
+    glClearColor,
+    glCompileShader,
+    glCreateProgram,
+    glCreateShader,
+    glCullFace,
+    glDeleteProgram,
+    glDeleteShader,
+    glDepthFunc,
+    glDepthMask,
+    glDisable,
+    glDrawArrays,
+    glDrawElements,
+    glEnable,
+    glEnableVertexAttribArray,
+    glGenBuffers,
+    glGenTextures,
+    glGetAttribLocation,
+    glGetProgramInfoLog,
+    glGetProgramiv,
+    glGetShaderInfoLog,
+    glGetShaderiv,
+    glGetUniformLocation,
+    glLineWidth,
+    glLinkProgram,
+    glPixelStorei,
+    glShaderSource,
+    glTexImage2D,
+    glTexParameteri,
+    glUniform1f,
+    glUniform1i,
+    glUniform3f,
+    glUniformMatrix3fv,
+    glUniformMatrix4fv,
+    glUseProgram,
+    glViewport,
+)
 from OpenGL.raw.GL.VERSION.GL_2_0 import glVertexAttribPointer as raw_glVertexAttribPointer
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QCursor, QMouseEvent, QWheelEvent
@@ -569,7 +649,7 @@ class GlobeGLWidget(QOpenGLWidget):
         self._refresh_cursor()
         self.update()
 
-    def set_paint_brush(self, width_deg: float, dropoff_percent: float) -> None:
+    def set_paint_brush(self, radius_km: float, dropoff_percent: float) -> None:
         """Update the paint brush preview angular width (degrees) and dropoff percentage.
 
         The brush is defined in geographic terms (degrees of arc) rather than
@@ -577,7 +657,7 @@ class GlobeGLWidget(QOpenGLWidget):
         just like the graticule.
         """
         # Cap at just under a hemisphere so large values stay a valid small circle.
-        radius_deg = min(89.0, max(0.0, float(width_deg)) / 2.0)
+        radius_deg = min(89.0, max(0.0, float(radius_km) / 111.0))
         self.paint_angular_radius = math.radians(radius_deg)
         self.paint_dropoff_percent = min(100.0, max(0.0, float(dropoff_percent)))
         if self.tool_mode == "paint":
