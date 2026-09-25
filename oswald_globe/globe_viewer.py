@@ -30,6 +30,8 @@ from oswald_globe.globe_widget import GlobeGLWidget
 from oswald_globe.icosphere import IcosphereGrid
 
 STYLE_FILE = Path(__file__).resolve().parent / "styles" / "style.qss"
+DEFAULT_COLORMAP_VMIN = -32767.0
+DEFAULT_COLORMAP_VMAX = 32767.0
 
 
 class GlobeViewer(QWidget):
@@ -48,8 +50,8 @@ class GlobeViewer(QWidget):
         width: Optional[int] = None,
         height: Optional[int] = None,
         responsive: bool = False,
-        vmin: float = -4000.0,
-        vmax: float = 4000.0,
+        vmin: float = DEFAULT_COLORMAP_VMIN,
+        vmax: float = DEFAULT_COLORMAP_VMAX,
         max_texture_size: int = 2048,
         relief: bool = False,
         relief_intensity: float = 1.5,
@@ -91,8 +93,8 @@ class GlobeViewer(QWidget):
         self.lighting = bool(lighting)
         self.show_graticule = bool(kwargs.get("show_graticule", graticule))
         self.title = title or "Interactive Globe Viewer"
-        self.vmin = float(vmin) if vmin is not None else -4000.0
-        self.vmax = float(vmax) if vmax is not None else 4000.0
+        self.vmin = float(vmin) if vmin is not None else DEFAULT_COLORMAP_VMIN
+        self.vmax = float(vmax) if vmax is not None else DEFAULT_COLORMAP_VMAX
 
         initial_center = centre if centre is not None else center
         if initial_center is not None:

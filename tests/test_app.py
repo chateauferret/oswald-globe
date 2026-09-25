@@ -7,7 +7,7 @@ from PIL import Image
 import pytest
 from PySide6.QtCore import QSettings, Qt, QPointF
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QComboBox, QFileDialog, QSlider
+from PySide6.QtWidgets import QComboBox, QFileDialog, QSlider, QSpinBox, QToolTip
 
 from oswald_globe.app import IcosphereProgressDialog, create_window, load_elevation
 from oswald_globe.icosphere import IcosphereGrid
@@ -35,6 +35,7 @@ def test_create_window_defaults_to_empty_sea_level_globe(qapp):
         np.testing.assert_allclose(window.viewer.data, 0.0)
         assert window.viewer.mesh_grid is not None
         assert len(window.viewer.mesh_grid.vertices) > 0
+        np.testing.assert_allclose(window.viewer.mesh_grid.values, 0.0)
     finally:
         window.close()
 
@@ -94,9 +95,12 @@ def test_create_window(qapp, tmp_path: Path):
     assert [action.text() for action in window._tools_menu.actions() if action.isChecked()] == ["Navigate"]
 
     assert window._legend_menu is not None
+    assert window._legend_menu.toolTipsVisible() is True
     legend_menu = window._legend_menu
     window._populate_legend_menu()
     assert [action.text() for action in legend_menu.actions()] == ["grayscale", "topography"]
+    assert all(action.icon().isNull() for action in legend_menu.actions())
+    assert all(action.defaultWidget() is not None for action in legend_menu.actions())
     assert [action.text() for action in legend_menu.actions() if action.isChecked()] == ["topography"]
 
     window.set_legend(":/legends/grayscale.txt")
@@ -166,7 +170,10 @@ def test_paint_tool_selection_shows_options_and_navigate_disposes(qapp):
 
         sliders = paint_tool.options_dialog.findChildren(QSlider)
         ranges = sorted((slider.minimum(), slider.maximum()) for slider in sliders)
-        assert ranges == [(0, 100), (0, 100), (0, 1000)]
+        assert ranges == [(-32767, 32767), (0, 100), (0, 1000)]
+        spin_boxes = paint_tool.options_dialog.findChildren(QSpinBox)
+        spin_ranges = sorted((spin.minimum(), spin.maximum()) for spin in spin_boxes)
+        assert spin_ranges == [(-32767, 32767), (0, 100), (0, 1000)]
         mode_combo = paint_tool.options_dialog.findChild(QComboBox)
         assert mode_combo is not None
         assert [mode_combo.itemText(i) for i in range(mode_combo.count())] == [
@@ -178,35 +185,121 @@ def test_paint_tool_selection_shows_options_and_navigate_disposes(qapp):
             "Multiply",
             "Average",
         ]
-        assert paint_tool.value() == 50
+        assert paint_tool.value() == 0
         assert paint_tool.mode() == "Replace"
         assert paint_tool.radius_km() == 100
         assert paint_tool.falloff_percent() == 50
+        assert paint_tool.options_dialog.value_spin.value() == 0
+        assert paint_tool.options_dialog.radius_spin.value() == 100
+        assert paint_tool.options_dialog.falloff_spin.value() == 50
+        assert paint_tool.options_dialog.value_spin.singleStep() == 256
+        assert paint_tool.options_dialog.radius_spin.singleStep() == 50
+        assert paint_tool.options_dialog.falloff_spin.singleStep() == 5
         paint_tool.options_dialog.value_slider.setValue(73)
         mode_combo.setCurrentText("Multiply")
         paint_tool.options_dialog.radius_slider.setValue(444)
         paint_tool.options_dialog.falloff_slider.setValue(11)
+        assert paint_tool.options_dialog.value_spin.value() == 73
+        assert paint_tool.options_dialog.radius_spin.value() == 444
+        assert paint_tool.options_dialog.falloff_spin.value() == 11
+
+        paint_tool.options_dialog.value_spin.setValue(61)
+        paint_tool.options_dialog.radius_spin.stepUp()
+        paint_tool.options_dialog.falloff_spin.stepDown()
+        assert paint_tool.options_dialog.value_slider.value() == 61
+        assert paint_tool.options_dialog.radius_slider.value() == 494
+        assert paint_tool.options_dialog.falloff_slider.value() == 6
+
+        paint_tool.options_dialog.value_spin.stepUp()
+        assert paint_tool.options_dialog.value_slider.value() == 317
+
+        paint_tool.options_dialog.radius_spin.lineEdit().setText("2000")
+        paint_tool.options_dialog.radius_spin.interpretText()
+        assert paint_tool.options_dialog.radius_spin.value() == 494
+        assert paint_tool.options_dialog.radius_slider.value() == 494
 
         navigate_action.trigger()
         assert navigate_action.isChecked() is True
         assert paint_action.isChecked() is False
         assert paint_tool.options_dialog is None
-        assert paint_tool.value() == 73
+        assert paint_tool.value() == 317
         assert paint_tool.mode() == "Multiply"
-        assert paint_tool.radius_km() == 444
-        assert paint_tool.falloff_percent() == 11
+        assert paint_tool.radius_km() == 494
+        assert paint_tool.falloff_percent() == 6
 
         paint_action.trigger()
         assert paint_tool.options_dialog is not None
-        assert paint_tool.options_dialog.value_slider.value() == 73
+        assert paint_tool.options_dialog.value_slider.value() == 317
         assert paint_tool.options_dialog.mode_combo.currentText() == "Multiply"
-        assert paint_tool.options_dialog.radius_slider.value() == 444
-        assert paint_tool.options_dialog.falloff_slider.value() == 11
+        assert paint_tool.options_dialog.radius_slider.value() == 494
+        assert paint_tool.options_dialog.falloff_slider.value() == 6
+        assert paint_tool.options_dialog.value_spin.value() == 317
+        assert paint_tool.options_dialog.radius_spin.value() == 494
+        assert paint_tool.options_dialog.falloff_spin.value() == 6
     finally:
         window.close()
 
 
-def test_paint_brush_release_pushes_undo_command(qapp, monkeypatch: pytest.MonkeyPatch, capsys):
+@pytest.mark.parametrize(
+    ("paint_mode", "paint_value", "expected_inner"),
+    [
+        ("Replace", 80, lambda original: np.full(original.shape, 80.0, dtype=np.float64)),
+        ("Add", 8, lambda original: original + 8.0),
+        ("Subtract", 8, lambda original: original - 8.0),
+        ("Minimum", 35, lambda original: np.minimum(original, 35.0)),
+        ("Maximum", 35, lambda original: np.maximum(original, 35.0)),
+        ("Multiply", 2, lambda original: original * 2.0),
+        ("Average", 80, lambda original: (original + 80.0) / 2.0),
+    ],
+)
+def test_brush_command_applies_selected_mode_and_tapers_outer_ring(paint_mode, paint_value, expected_inner):
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(1)
+    original = np.linspace(0.0, 100.0, grid.vertex_count(), dtype=np.float64)
+    grid.set_layer("elevation", original.copy())
+
+    lat_deg, lon_deg = grid.vertex_lat_lon()
+    target_index = 0
+    radius_km = 8000.0
+    falloff_percent = 50.0
+
+    command = BrushPaintCommand(
+        target_lat_deg=float(lat_deg[target_index]),
+        target_lon_deg=float(lon_deg[target_index]),
+        radius_km=radius_km,
+        falloff_percent=falloff_percent,
+        paint_value=paint_value,
+        paint_mode=paint_mode,
+        mesh_grid=grid,
+        apply_vertex_values=lambda indices, values: grid.get_layer("elevation").values.__setitem__(indices, values),
+    )
+
+    center = grid.vertices[target_index]
+    distances = np.arccos(np.clip(grid.vertices @ center, -1.0, 1.0))
+    outer_radius = np.deg2rad(min(89.0, radius_km / 111.0))
+    inner_radius = outer_radius * (falloff_percent / 100.0)
+    inner_mask = distances <= inner_radius + 1e-9
+    transition_mask = (distances > inner_radius + 1e-9) & (distances <= outer_radius + 1e-9)
+
+    assert np.any(inner_mask)
+    assert np.any(transition_mask)
+
+    command.redo()
+
+    expected_operated = expected_inner(original)
+    np.testing.assert_allclose(grid.get_layer("elevation").values[inner_mask], expected_operated[inner_mask])
+    transition_blend = (distances[transition_mask] - inner_radius) / (outer_radius - inner_radius)
+    expected_transition = (
+        (1.0 - transition_blend) * expected_operated[transition_mask]
+        + transition_blend * original[transition_mask]
+    )
+    np.testing.assert_allclose(grid.get_layer("elevation").values[transition_mask], expected_transition)
+
+    command.undo()
+    np.testing.assert_allclose(grid.get_layer("elevation").values, original)
+
+
+def test_paint_brush_release_pushes_undo_command(qapp, monkeypatch: pytest.MonkeyPatch):
     window = create_window()
     try:
         widget = window.viewer.gl_widget
@@ -219,16 +312,15 @@ def test_paint_brush_release_pushes_undo_command(qapp, monkeypatch: pytest.Monke
 
         def factory(payload):
             payloads.append(payload)
-            return BrushPaintCommand(
-                target_lat_deg=float(payload["target_lat_deg"]),
-                target_lon_deg=float(payload["target_lon_deg"]),
-                radius_km=float(payload["radius_km"]),
-                falloff_percent=float(payload["falloff_percent"]),
-                paint_value=99,
-                paint_mode="Replace",
-            )
+            return window._create_brush_command(payload)
 
         widget.set_brush_command_factory(factory)
+        raster_sync_calls = []
+        monkeypatch.setattr(
+            widget.mesh_grid,
+            "to_equirectangular",
+            lambda height, width, k=8: raster_sync_calls.append((height, width, k)) or np.zeros((height, width), dtype=np.float32),
+        )
         monkeypatch.setattr(
             "oswald_globe.globe_widget.unproject_point",
             lambda *args, **kwargs: {"target_lat": 0.5, "target_lon": -1.0, "value": 0.0, "lat_deg": 0.0, "lon_deg": 0.0},
@@ -266,16 +358,13 @@ def test_paint_brush_release_pushes_undo_command(qapp, monkeypatch: pytest.Monke
         ]
         assert stack.can_undo() is True
         assert stack.can_redo() is False
-        out = capsys.readouterr().out
-        assert out.count("[brush] apply paint stroke placeholder") == 2
+        assert raster_sync_calls == []
 
         stack.undo()
-        out = capsys.readouterr().out
-        assert "[brush] undo paint stroke placeholder" in out
+        assert stack.can_redo() is True
 
         stack.redo()
-        out = capsys.readouterr().out
-        assert "[brush] apply paint stroke placeholder" in out
+        assert raster_sync_calls == []
     finally:
         window.close()
 
@@ -287,16 +376,7 @@ def test_paint_drag_updates_brush_hover_position(qapp, monkeypatch: pytest.Monke
         widget.set_tool_mode("paint")
 
         widget.set_undo_stack(UndoStack())
-        widget.set_brush_command_factory(
-            lambda payload: BrushPaintCommand(
-                target_lat_deg=float(payload["target_lat_deg"]),
-                target_lon_deg=float(payload["target_lon_deg"]),
-                radius_km=float(payload["radius_km"]),
-                falloff_percent=float(payload["falloff_percent"]),
-                paint_value=99,
-                paint_mode="Replace",
-            )
-        )
+        widget.set_brush_command_factory(window._create_brush_command)
 
         updates = []
         monkeypatch.setattr(widget, "update", lambda: updates.append(True))
@@ -320,6 +400,56 @@ def test_paint_drag_updates_brush_hover_position(qapp, monkeypatch: pytest.Monke
         assert widget._hover_target_lat == pytest.approx(0.5)
         assert widget._hover_target_lon == pytest.approx(-1.0)
         assert updates
+    finally:
+        window.close()
+
+
+def test_current_raster_data_syncs_mesh_edits_on_demand(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        widget = window.viewer.gl_widget
+        original_shape = widget.raw_data.shape
+        raster_sync_calls = []
+        expected = np.full(original_shape, 7.0, dtype=np.float32)
+        monkeypatch.setattr(
+            widget.mesh_grid,
+            "to_equirectangular",
+            lambda height, width, k=8: raster_sync_calls.append((height, width, k)) or expected.copy(),
+        )
+
+        widget.apply_mesh_vertex_values(np.array([0], dtype=np.intp), np.array([123.0], dtype=np.float64))
+        assert raster_sync_calls == []
+
+        current = widget.current_raster_data()
+        assert raster_sync_calls == [(original_shape[0], original_shape[1], 8)]
+        np.testing.assert_allclose(current, expected)
+        np.testing.assert_allclose(window.viewer.data, expected)
+    finally:
+        window.close()
+
+
+def test_tooltip_uses_mesh_sample_value(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        widget = window.viewer.gl_widget
+        shown = {}
+
+        monkeypatch.setattr(
+            "oswald_globe.globe_widget.unproject_point",
+            lambda *args, **kwargs: {
+                "target_lat": 0.5,
+                "target_lon": -1.0,
+                "value": 0.0,
+                "lat_deg": 12.0,
+                "lon_deg": 34.0,
+            },
+        )
+        monkeypatch.setattr(widget.mesh_grid, "sample", lambda lat, lon, k=8: np.array([123.45], dtype=np.float64))
+        monkeypatch.setattr(QToolTip, "showText", lambda pos, text, owner: shown.setdefault("text", text))
+
+        widget._update_tooltip(12.0, 34.0)
+
+        assert shown["text"].endswith("Value: 123.45")
     finally:
         window.close()
 

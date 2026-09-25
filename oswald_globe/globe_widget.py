@@ -111,11 +111,14 @@ from oswald_globe.utils import (
     mat4_ortho,
     mat4_rotate_x,
     mat4_rotate_y,
+    sample_equirectangular,
     unproject_point,
 )
 from oswald_globe.undo_stack import BrushPaintCommand, UndoStack
 
 SHADERS_DIR = Path(__file__).resolve().parent / "shaders"
+DEFAULT_COLORMAP_VMIN = -32767.0
+DEFAULT_COLORMAP_VMAX = 32767.0
 
 
 def _color_to_rgb(color: Union[QColor, Tuple[float, float, float], Tuple[float, float, float, float], str]) -> Tuple[float, float, float]:
@@ -184,8 +187,8 @@ class GlobeGLWidget(QOpenGLWidget):
         self,
         data: np.ndarray,
         cmap: Any = "terrain",
-        vmin: float = -4000.0,
-        vmax: float = 4000.0,
+        vmin: float = DEFAULT_COLORMAP_VMIN,
+        vmax: float = DEFAULT_COLORMAP_VMAX,
         max_texture_size: int = 2048,
         relief: bool = False,
         relief_intensity: float = 1.5,
@@ -253,6 +256,7 @@ class GlobeGLWidget(QOpenGLWidget):
 
         # Downsample data grid for tooltips and texture if needed
         self.data_grid = self._prepare_grid_data(self.raw_data)
+        self._fill_missing_mesh_values_from_raster()
 
         # GL Resource handles
         self.program = 0
@@ -274,6 +278,7 @@ class GlobeGLWidget(QOpenGLWidget):
         self.brush_vertex_count = 0
         self._gl_initialized = False
         self._first_frame_rendered = False
+        self._mesh_raster_dirty = False
 
         # Animation timer (approx 60 FPS)
         self.anim_timer = QTimer(self)
@@ -296,6 +301,79 @@ class GlobeGLWidget(QOpenGLWidget):
             resized = pil_temp.resize((new_w, new_h), resample=Image.Resampling.BILINEAR)
             return np.asarray(resized, dtype=np.float32)
         return np.ascontiguousarray(data, dtype=np.float32)
+
+    def _fill_missing_mesh_values_from_raster(self) -> None:
+        if not self.has_mesh or self.mesh_grid is None:
+            return
+        layer = self.mesh_grid.get_layer("elevation")
+        missing = ~np.isfinite(layer.values)
+        if not np.any(missing):
+            return
+        lat_deg, lon_deg = self.mesh_grid.vertex_lat_lon()
+        layer.values[missing] = sample_equirectangular(self.raw_data, lat_deg[missing], lon_deg[missing])
+
+    def _set_raster_data(self, raster: np.ndarray) -> np.ndarray:
+        updated_raster = np.asarray(raster, dtype=np.float32)
+        self.raw_data = updated_raster
+        self.data_grid = self._prepare_grid_data(updated_raster)
+
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "data"):
+            parent.data = updated_raster
+        return updated_raster
+
+    def current_raster_data(self) -> np.ndarray:
+        if self.has_mesh and self.mesh_grid is not None and self._mesh_raster_dirty:
+            self._set_raster_data(self.mesh_grid.to_equirectangular(*self.raw_data.shape))
+            self._mesh_raster_dirty = False
+        return self.raw_data
+
+    def _sample_value_at_location(self, lat_deg: float, lon_deg: float) -> Optional[float]:
+        if self.has_mesh and self.mesh_grid is not None:
+            sampled = self.mesh_grid.sample(
+                np.array([lat_deg], dtype=np.float64),
+                np.array([lon_deg], dtype=np.float64),
+            )
+            if sampled.size == 0 or not np.isfinite(sampled[0]):
+                return None
+            return float(sampled[0])
+
+        sampled = sample_equirectangular(
+            self.raw_data,
+            np.array([lat_deg], dtype=np.float64),
+            np.array([lon_deg], dtype=np.float64),
+        )
+        if sampled.size == 0 or not np.isfinite(sampled[0]):
+            return None
+        return float(sampled[0])
+
+    def _update_mesh_height_buffer(self) -> None:
+        if not self.has_mesh or self.mesh_grid is None or not self._gl_initialized or self.height_vbo == 0:
+            return
+        heights = self.mesh_grid.values.astype(np.float32)
+        self.makeCurrent()
+        glBindBuffer(GL_ARRAY_BUFFER, self.height_vbo)
+        glBufferData(GL_ARRAY_BUFFER, heights.nbytes, heights, GL_STATIC_DRAW)
+        self.doneCurrent()
+
+    def apply_mesh_vertex_values(self, vertex_indices: np.ndarray, values: np.ndarray) -> None:
+        if not self.has_mesh or self.mesh_grid is None:
+            raise RuntimeError("Painting requires a mesh-backed globe.")
+
+        indices = np.asarray(vertex_indices, dtype=np.intp)
+        new_values = np.asarray(values, dtype=np.float64)
+        if indices.shape != new_values.shape:
+            raise ValueError(
+                "Paint update indices and values must have matching shapes, "
+                f"got {indices.shape} and {new_values.shape}."
+            )
+
+        layer = self.mesh_grid.get_layer("elevation")
+        layer.values[indices] = new_values
+        self._mesh_raster_dirty = True
+
+        self._update_mesh_height_buffer()
+        self.update()
 
     def _get_colormap(self):
         if isinstance(self.cmap, str):
@@ -1081,9 +1159,10 @@ class GlobeGLWidget(QOpenGLWidget):
             QToolTip.hideText()
             return
 
+        sampled_value = self._sample_value_at_location(pt["lat_deg"], pt["lon_deg"])
         val_text = "N/A"
-        if pt["value"] is not None and np.isfinite(pt["value"]):
-            v = pt["value"]
+        if sampled_value is not None:
+            v = sampled_value
             if abs(v) >= 1000 or int(v) == v:
                 val_text = f"{v:.1f}"
             elif abs(v) < 0.01 and v != 0:

@@ -21,6 +21,8 @@ def test_globe_viewer_numpy_array(qapp):
     assert viewer.raster_width == 360
     assert viewer.raster_height == 180
     assert viewer.data.shape == (180, 360)
+    assert viewer.vmin == -32767.0
+    assert viewer.vmax == 32767.0
     assert viewer.gl_widget is not None
     assert viewer.title_label.text() == "Interactive Globe Viewer"
 
