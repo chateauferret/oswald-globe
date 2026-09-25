@@ -6,20 +6,16 @@ import argparse
 import sys
 from pathlib import Path
 from typing import Dict, Optional, Union
-
+from PySide6.QtCore import QSize
 import numpy as np
-from PySide6.QtCore import QDir, QSize, QSettings, QThread, Qt, QTimer, Slot
+from PySide6.QtCore import QDir, QSettings, QThread, Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QIcon, QImageReader, QKeySequence, QLinearGradient, QPainter, QPixmap, QSurfaceFormat
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
-    QHBoxLayout,
-    QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
-    QWidget,
-    QWidgetAction,
 )
 
 if __package__ in {None, ""}:
@@ -156,18 +152,6 @@ class GlobeMainWindow(QMainWindow):
 
         self._view_menu = self.menuBar().addMenu("View")
         self._legend_menu = self._view_menu.addMenu("Legend")
-        self._legend_menu.setStyleSheet(
-            "QMenu { menu-scrollable: 1; } "
-            "QMenu::item { min-height: 32px; padding: 2px 4px; margin: 0px; border: 0px; } "
-            "QMenu::item:hover { background: rgba(255,255,255,60); } "
-            "QMenu::item:selected { background: rgba(255,255,255,80); } "
-            "QMenu::indicator { width: 12px; height: 12px; margin-right: 8px; } "
-            "QMenu::indicator:checked { image: url(:/icons/checkmark.png); } "
-            "QMenu::item { qproperty-iconSize: 160px 32px; } "
-            "QMenu::item { text-align: right; }"
-        )
-        self._legend_menu.setMinimumWidth(324)
-        self._legend_menu.setToolTipsVisible(True)
         self._legend_menu.aboutToShow.connect(self._populate_legend_menu)
         self._sync_edit_actions()
 
@@ -257,21 +241,18 @@ class GlobeMainWindow(QMainWindow):
         self._current_legend = self._default_legend_source()
         return self._current_legend
 
-    def _legend_pixmap(self, legend_source: str) -> QPixmap:
+    def _legend_icon(self, legend_source: str) -> QIcon:
         cmap = load_topo_cmap(legend_source, name=self._legend_name(legend_source))
         samples = np.linspace(0.0, 1.0, 256, dtype=np.float32)
         rgba = np.asarray(cmap(samples), dtype=np.float32)
         if rgba.ndim == 1:
             rgba = np.tile(rgba, (256, 1))
 
-        panel_width = 160
-        panel_height = 32
-        margin = 2
-        pixmap = QPixmap(panel_width, panel_height)
+        pixmap = QPixmap(320, 48)
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
         try:
-            gradient = QLinearGradient(0, 0, panel_width, 0)
+            gradient = QLinearGradient(0, 0, 160, 0)
             for idx in range(rgba.shape[0]):
                 color = QColor.fromRgbF(
                     float(rgba[idx, 0]),
@@ -280,77 +261,12 @@ class GlobeMainWindow(QMainWindow):
                     float(rgba[idx, 3]),
                 )
                 gradient.setColorAt(float(idx) / max(1, rgba.shape[0] - 1), color)
-            painter.fillRect(margin, margin, panel_width - 2 * margin, panel_height - 2 * margin, gradient)
+            painter.fillRect(0, 0, 160, 16, gradient)
             painter.setPen(QColor(0, 0, 0, 80))
-            painter.drawRect(margin, margin, panel_width - 2 * margin - 1, panel_height - 2 * margin - 1)
+            painter.drawRect(0, 0, 159, 15)
         finally:
             painter.end()
-        return pixmap
-
-    def _legend_icon(self, legend_source: str) -> QIcon:
-        return QIcon(self._legend_pixmap(legend_source))
-
-    def _legend_action_widget(self, legend_source: str) -> QWidget:
-        name = self._legend_name(legend_source)
-        widget = QWidget(self._legend_menu)
-        widget.setStyleSheet(
-            "QWidget { background: transparent; border: none; border-radius: 4px; } "
-            "QWidget:hover { background: rgba(255,255,255,60); }"
-        )
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(8)
-
-        check = QLabel("✓", widget)
-        check.setObjectName("check")
-        check.setMinimumWidth(12)
-        check.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-        check.setStyleSheet("color: #ffffff; font-weight: bold; visibility: hidden;")
-        layout.addWidget(check)
-
-        label = QLabel(name, widget)
-        label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-        layout.addWidget(label)
-
-        layout.addStretch()
-
-        preview = QLabel(widget)
-        preview.setPixmap(
-            self._legend_pixmap(legend_source).scaled(
-                160,
-                32,
-                Qt.AspectRatioMode.IgnoreAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
-        preview.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
-        preview.setFixedSize(160, 32)
-        layout.addWidget(preview)
-
-        widget.setMinimumHeight(32)
-        widget.setSizePolicy(widget.sizePolicy().horizontalPolicy(), widget.sizePolicy().verticalPolicy())
-
-        def refresh_state(checked: bool) -> None:
-            check.setVisible(checked)
-            check.setStyleSheet(
-                "color: #ffffff; font-weight: bold;" if checked else "color: transparent; font-weight: bold;"
-            )
-
-        refresh_state(False)
-        return widget
-
-    def _set_legend_widget_checked(self, widget: QWidget, checked: bool) -> None:
-        check = widget.findChild(QLabel, "check") if hasattr(widget, "findChild") else None
-        if check is None:
-            return
-        if checked:
-            check.setText("✓")
-            check.setVisible(True)
-            check.setStyleSheet("color: #ffffff; font-weight: bold;")
-        else:
-            check.setText(" ")
-            check.setVisible(True)
-            check.setStyleSheet("color: transparent; font-weight: bold;")
+        return QIcon(pixmap)
 
     def _populate_legend_menu(self) -> None:
         self._legend_menu.clear()
@@ -366,17 +282,13 @@ class GlobeMainWindow(QMainWindow):
         self._legend_action_group = QActionGroup(self._legend_menu)
         self._legend_action_group.setExclusive(True)
         for legend_source in legends:
-            action = QWidgetAction(self._legend_menu)
-            widget = self._legend_action_widget(legend_source)
-            action.setText(self._legend_name(legend_source))
+            action = self._legend_menu.addAction(self._legend_name(legend_source))
+            action.setIconSize(QSize(320, 48))
+            action.setIcon(self._legend_icon(legend_source))
             action.setCheckable(True)
             action.setChecked(legend_source == current_legend)
-            action.setDefaultWidget(widget)
             action.triggered.connect(lambda checked=False, source=legend_source: self.set_legend(source))
-            action.toggled.connect(lambda checked, widget=widget: self._set_legend_widget_checked(widget, checked))
-            self._legend_menu.addAction(action)
             self._legend_action_group.addAction(action)
-            self._set_legend_widget_checked(widget, action.isChecked())
 
     def set_legend(self, legend_source: Union[str, Path]) -> None:
         legend_value = str(legend_source)
