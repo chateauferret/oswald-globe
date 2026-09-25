@@ -12,7 +12,7 @@ from typing import Callable, Dict, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
 from PySide6.QtCore import QDir, QObject, QSettings, QThread, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QImageReader, QSurfaceFormat
+from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QImageReader, QKeySequence, QSurfaceFormat
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -44,11 +44,13 @@ try:
     from .colormap import DEFAULT_TOPO_LEGEND, LEGENDS_DIR, load_topo_cmap
     from .globe_viewer import GlobeViewer
     from .icosphere import IcosphereBuildCancelled, IcosphereGrid
+    from .undo_stack import BrushPaintCommand, UndoStack
 except ImportError:  # pragma: no cover - supports running as a script
     from oswald_globe import resources_rc  # noqa: F401
     from oswald_globe.colormap import DEFAULT_TOPO_LEGEND, LEGENDS_DIR, load_topo_cmap
     from oswald_globe.globe_viewer import GlobeViewer
     from oswald_globe.icosphere import IcosphereBuildCancelled, IcosphereGrid
+    from oswald_globe.undo_stack import BrushPaintCommand, UndoStack
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HEIGHTFIELD = PACKAGE_ROOT / "data" / "heightfield.tif"
@@ -558,6 +560,7 @@ class GlobeMainWindow(QMainWindow):
         self._settings = settings or APP_SETTINGS
         self._legend_action_group: Optional[QActionGroup] = None
         self._tool_action_group: Optional[QActionGroup] = None
+        self._undo_stack = UndoStack(on_changed=self._sync_edit_actions)
         self._tools: Dict[str, Tool] = {
             "navigate": NavigateTool(self),
             "paint": PaintTool(self),
@@ -565,6 +568,9 @@ class GlobeMainWindow(QMainWindow):
         self._active_tool: Optional[Tool] = None
         self._active_tool_name: Optional[str] = None
         self._file_menu: Optional[QMenu] = None
+        self._edit_menu: Optional[QMenu] = None
+        self._undo_action: Optional[QAction] = None
+        self._redo_action: Optional[QAction] = None
         self._tools_menu: Optional[QMenu] = None
         self._view_menu: Optional[QMenu] = None
         self._current_legend = self._load_current_legend()
@@ -606,7 +612,17 @@ class GlobeMainWindow(QMainWindow):
         settings_action.triggered.connect(self.open_settings)
         self._file_menu.addAction(settings_action)
 
-        self.menuBar().addMenu("Edit")
+        self._edit_menu = self.menuBar().addMenu("Edit")
+
+        self._undo_action = QAction("Undo", self)
+        self._undo_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Undo))
+        self._undo_action.triggered.connect(self._undo_stack.undo)
+        self._edit_menu.addAction(self._undo_action)
+
+        self._redo_action = QAction("Redo", self)
+        self._redo_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Redo))
+        self._redo_action.triggered.connect(self._undo_stack.redo)
+        self._edit_menu.addAction(self._redo_action)
 
         self._tools_menu = self.menuBar().addMenu("Tools")
         self._tool_action_group = QActionGroup(self._tools_menu)
@@ -632,6 +648,7 @@ class GlobeMainWindow(QMainWindow):
         self._view_menu = self.menuBar().addMenu("View")
         self._legend_menu = self._view_menu.addMenu("Legend")
         self._legend_menu.aboutToShow.connect(self._populate_legend_menu)
+        self._sync_edit_actions()
 
     def _set_active_tool(self, tool_name: str) -> None:
         next_tool = self._tools.get(tool_name)
@@ -653,6 +670,28 @@ class GlobeMainWindow(QMainWindow):
         paint_tool = self._tools.get("paint")
         if isinstance(paint_tool, PaintTool):
             gl_widget.set_paint_brush(paint_tool.radius_km(), paint_tool.falloff_percent())
+            gl_widget.set_brush_command_factory(self._create_brush_command)
+        gl_widget.set_undo_stack(self._undo_stack)
+
+    def _create_brush_command(self, payload: Dict[str, object]) -> BrushPaintCommand:
+        paint_tool = self._tools.get("paint")
+        if not isinstance(paint_tool, PaintTool):
+            raise RuntimeError("Paint tool is not available.")
+
+        return BrushPaintCommand(
+            target_lat_deg=float(payload["target_lat_deg"]),
+            target_lon_deg=float(payload["target_lon_deg"]),
+            radius_km=float(payload["radius_km"]),
+            falloff_percent=float(payload["falloff_percent"]),
+            paint_value=paint_tool.value(),
+            paint_mode=paint_tool.mode(),
+        )
+
+    def _sync_edit_actions(self) -> None:
+        if self._undo_action is not None:
+            self._undo_action.setEnabled(self._undo_stack.can_undo())
+        if self._redo_action is not None:
+            self._redo_action.setEnabled(self._undo_stack.can_redo())
 
     def _legend_name(self, legend_source: Union[str, Path]) -> str:
         return Path(str(legend_source).removeprefix(":/")).stem
@@ -970,7 +1009,9 @@ class GlobeMainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _image_file_filter(self) -> str:
-        extensions = sorted({bytes(fmt).decode("ascii").lower() for fmt in QImageReader.supportedImageFormats()})
+        extensions = {bytes(fmt).decode("ascii").lower() for fmt in QImageReader.supportedImageFormats()}
+        extensions.update({"tif", "tiff"})
+        extensions = sorted(extensions)
         patterns = " ".join(f"*.{extension}" for extension in extensions)
         return f"Image Files ({patterns});;All Files (*)"
 

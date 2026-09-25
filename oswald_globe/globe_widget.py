@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 from OpenGL.GL import (
@@ -113,6 +113,7 @@ from oswald_globe.utils import (
     mat4_rotate_y,
     unproject_point,
 )
+from oswald_globe.undo_stack import BrushPaintCommand, UndoStack
 
 SHADERS_DIR = Path(__file__).resolve().parent / "shaders"
 
@@ -232,6 +233,7 @@ class GlobeGLWidget(QOpenGLWidget):
 
         self.is_auto_spin = bool(auto_rotate)
         self.is_dragging = False
+        self._middle_dragging = False
         self.last_mouse_x = 0
         self.last_mouse_y = 0
         self.vel_x = 0.0
@@ -241,10 +243,13 @@ class GlobeGLWidget(QOpenGLWidget):
         self.tool_mode = "navigate"
         self.paint_angular_radius = math.radians(5.0)
         self.paint_dropoff_percent = 50.0
+        self._paint_brush_radius_km = 100.0
         self._mouse_pos: Optional[QPoint] = None
         self._mouse_over_globe = False
         self._hover_target_lat = 0.0
         self._hover_target_lon = 0.0
+        self._undo_stack: Optional[UndoStack] = None
+        self._brush_command_factory: Optional[Callable[[Dict[str, Any]], BrushPaintCommand]] = None
 
         # Downsample data grid for tooltips and texture if needed
         self.data_grid = self._prepare_grid_data(self.raw_data)
@@ -657,13 +662,26 @@ class GlobeGLWidget(QOpenGLWidget):
         just like the graticule.
         """
         # Cap at just under a hemisphere so large values stay a valid small circle.
+        self._paint_brush_radius_km = float(radius_km)
         radius_deg = min(89.0, max(0.0, float(radius_km) / 111.0))
         self.paint_angular_radius = math.radians(radius_deg)
         self.paint_dropoff_percent = min(100.0, max(0.0, float(dropoff_percent)))
         if self.tool_mode == "paint":
             self.update()
 
+    def set_undo_stack(self, undo_stack: Optional[UndoStack]) -> None:
+        self._undo_stack = undo_stack
+
+    def set_brush_command_factory(
+        self,
+        factory: Optional[Callable[[Dict[str, Any]], BrushPaintCommand]],
+    ) -> None:
+        self._brush_command_factory = factory
+
     def _refresh_cursor(self) -> None:
+        if self._middle_dragging:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
         if self.tool_mode == "paint":
             if self._mouse_over_globe:
                 self.setCursor(Qt.CursorShape.BlankCursor)
@@ -922,6 +940,15 @@ class GlobeGLWidget(QOpenGLWidget):
             self.last_mouse_y = event.position().y()
             self.vel_x = 0.0
             self.vel_y = 0.0
+        elif event.button() == Qt.MouseButton.MiddleButton:
+            self.is_dragging = True
+            self._middle_dragging = True
+            self._refresh_cursor()
+            QToolTip.hideText()
+            self.last_mouse_x = event.position().x()
+            self.last_mouse_y = event.position().y()
+            self.vel_x = 0.0
+            self.vel_y = 0.0
 
     def mouseMoveEvent(self, event: QMouseEvent):
         x = event.position().x()
@@ -938,6 +965,11 @@ class GlobeGLWidget(QOpenGLWidget):
             self._hover_target_lon = pt["target_lon"]
         if was_over_globe != self._mouse_over_globe:
             self._refresh_cursor()
+
+        if self.tool_mode == "paint" and (event.buttons() & Qt.MouseButton.LeftButton):
+            self._paint_at_position(pt)
+            self.update()
+            return
 
         if self.is_dragging:
             dx = x - self.last_mouse_x
@@ -960,11 +992,50 @@ class GlobeGLWidget(QOpenGLWidget):
                 self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton and self.is_dragging:
+        if event.button() not in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton):
+            return
+
+        x = event.position().x()
+        y = event.position().y()
+
+        if event.button() == Qt.MouseButton.LeftButton and self.tool_mode == "paint":
+            pt = unproject_point(
+                x, y, self.width(), self.height(), self.zoom, self.center_lat, self.center_lon, self.data_grid
+            )
+            self._paint_at_position(pt)
+            self.update()
+            return
+
+        if self.is_dragging:
             self.is_dragging = False
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._middle_dragging = False
             self._refresh_cursor()
             self._emit_center()
             self.update()
+
+    def _paint_at_position(self, pt: Optional[Dict[str, Any]]) -> None:
+        if pt is None:
+            self._mouse_over_globe = False
+            self._refresh_cursor()
+            return
+
+        self._mouse_over_globe = True
+        self._hover_target_lat = pt["target_lat"]
+        self._hover_target_lon = pt["target_lon"]
+
+        if self._brush_command_factory is None or self._undo_stack is None:
+            raise RuntimeError("Brush command handling has not been configured.")
+
+        command = self._brush_command_factory(
+            {
+                "target_lat_deg": math.degrees(pt["target_lat"]),
+                "target_lon_deg": math.degrees(pt["target_lon"]),
+                "radius_km": self._paint_brush_radius_km,
+                "falloff_percent": self.paint_dropoff_percent,
+            }
+        )
+        self._undo_stack.push(command)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:

@@ -5,12 +5,13 @@ import sys
 import numpy as np
 from PIL import Image
 import pytest
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QSettings, Qt, QPointF
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QComboBox, QFileDialog, QSlider
 
 from oswald_globe.app import IcosphereProgressDialog, create_window, load_elevation
 from oswald_globe.icosphere import IcosphereGrid
+from oswald_globe.undo_stack import BrushPaintCommand, UndoStack
 
 
 def test_load_elevation(tmp_path: Path):
@@ -85,6 +86,9 @@ def test_create_window(qapp, tmp_path: Path):
         "Save As...",
         "Settings",
     ]
+    assert window._edit_menu is not None
+    assert [action.text() for action in window._edit_menu.actions()] == ["Undo", "Redo"]
+    assert [action.isEnabled() for action in window._edit_menu.actions()] == [False, False]
     assert window._tools_menu is not None
     assert [action.text() for action in window._tools_menu.actions()] == ["Navigate", "Paint"]
     assert [action.text() for action in window._tools_menu.actions() if action.isChecked()] == ["Navigate"]
@@ -198,6 +202,185 @@ def test_paint_tool_selection_shows_options_and_navigate_disposes(qapp):
         assert paint_tool.options_dialog.mode_combo.currentText() == "Multiply"
         assert paint_tool.options_dialog.radius_slider.value() == 444
         assert paint_tool.options_dialog.falloff_slider.value() == 11
+    finally:
+        window.close()
+
+
+def test_paint_brush_release_pushes_undo_command(qapp, monkeypatch: pytest.MonkeyPatch, capsys):
+    window = create_window()
+    try:
+        widget = window.viewer.gl_widget
+        widget.set_tool_mode("paint")
+
+        stack = UndoStack()
+        widget.set_undo_stack(stack)
+
+        payloads = []
+
+        def factory(payload):
+            payloads.append(payload)
+            return BrushPaintCommand(
+                target_lat_deg=float(payload["target_lat_deg"]),
+                target_lon_deg=float(payload["target_lon_deg"]),
+                radius_km=float(payload["radius_km"]),
+                falloff_percent=float(payload["falloff_percent"]),
+                paint_value=99,
+                paint_mode="Replace",
+            )
+
+        widget.set_brush_command_factory(factory)
+        monkeypatch.setattr(
+            "oswald_globe.globe_widget.unproject_point",
+            lambda *args, **kwargs: {"target_lat": 0.5, "target_lon": -1.0, "value": 0.0, "lat_deg": 0.0, "lon_deg": 0.0},
+        )
+
+        class PaintEvent:
+            def __init__(self, x: float, y: float):
+                self._pos = QPointF(x, y)
+
+            def button(self):
+                return Qt.MouseButton.LeftButton
+
+            def buttons(self):
+                return Qt.MouseButton.LeftButton
+
+            def position(self):
+                return self._pos
+
+        widget.mouseMoveEvent(PaintEvent(12.0, 34.0))
+        widget.mouseReleaseEvent(PaintEvent(12.0, 34.0))
+
+        assert payloads == [
+            {
+                "target_lat_deg": pytest.approx(28.64788975654116),
+                "target_lon_deg": pytest.approx(-57.29577951308232),
+                "radius_km": pytest.approx(100.0),
+                "falloff_percent": pytest.approx(50.0),
+            },
+            {
+                "target_lat_deg": pytest.approx(28.64788975654116),
+                "target_lon_deg": pytest.approx(-57.29577951308232),
+                "radius_km": pytest.approx(100.0),
+                "falloff_percent": pytest.approx(50.0),
+            }
+        ]
+        assert stack.can_undo() is True
+        assert stack.can_redo() is False
+        out = capsys.readouterr().out
+        assert out.count("[brush] apply paint stroke placeholder") == 2
+
+        stack.undo()
+        out = capsys.readouterr().out
+        assert "[brush] undo paint stroke placeholder" in out
+
+        stack.redo()
+        out = capsys.readouterr().out
+        assert "[brush] apply paint stroke placeholder" in out
+    finally:
+        window.close()
+
+
+def test_paint_drag_updates_brush_hover_position(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        widget = window.viewer.gl_widget
+        widget.set_tool_mode("paint")
+
+        widget.set_undo_stack(UndoStack())
+        widget.set_brush_command_factory(
+            lambda payload: BrushPaintCommand(
+                target_lat_deg=float(payload["target_lat_deg"]),
+                target_lon_deg=float(payload["target_lon_deg"]),
+                radius_km=float(payload["radius_km"]),
+                falloff_percent=float(payload["falloff_percent"]),
+                paint_value=99,
+                paint_mode="Replace",
+            )
+        )
+
+        updates = []
+        monkeypatch.setattr(widget, "update", lambda: updates.append(True))
+        monkeypatch.setattr(
+            "oswald_globe.globe_widget.unproject_point",
+            lambda *args, **kwargs: {"target_lat": 0.5, "target_lon": -1.0, "value": 0.0, "lat_deg": 0.0, "lon_deg": 0.0},
+        )
+
+        class PaintEvent:
+            def __init__(self, x: float, y: float):
+                self._pos = QPointF(x, y)
+
+            def buttons(self):
+                return Qt.MouseButton.LeftButton
+
+            def position(self):
+                return self._pos
+
+        widget.mouseMoveEvent(PaintEvent(12.0, 34.0))
+
+        assert widget._hover_target_lat == pytest.approx(0.5)
+        assert widget._hover_target_lon == pytest.approx(-1.0)
+        assert updates
+    finally:
+        window.close()
+
+
+def test_middle_drag_pans_globe_in_paint_mode(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        widget = window.viewer.gl_widget
+        widget.set_tool_mode("paint")
+
+        widget.set_undo_stack(UndoStack())
+        monkeypatch.setattr(
+            "oswald_globe.globe_widget.unproject_point",
+            lambda *args, **kwargs: {
+                "target_lat": 0.5,
+                "target_lon": -1.0,
+                "value": 0.0,
+                "lat_deg": 0.0,
+                "lon_deg": 0.0,
+            },
+        )
+
+        class MiddleEvent:
+            def __init__(self, x: float, y: float):
+                self._pos = QPointF(x, y)
+
+            def button(self):
+                return Qt.MouseButton.MiddleButton
+
+            def buttons(self):
+                return Qt.MouseButton.MiddleButton
+
+            def position(self):
+                return self._pos
+
+        class HoverEvent:
+            def __init__(self, x: float, y: float):
+                self._pos = QPointF(x, y)
+
+            def buttons(self):
+                return Qt.MouseButton.NoButton
+
+            def position(self):
+                return self._pos
+
+        start_lon = widget.center_lon
+        start_lat = widget.center_lat
+
+        widget.mouseMoveEvent(HoverEvent(12.0, 34.0))
+        assert widget.cursor().shape() == Qt.CursorShape.BlankCursor
+
+        widget.mousePressEvent(MiddleEvent(12.0, 34.0))
+        assert widget.cursor().shape() == Qt.CursorShape.ClosedHandCursor
+        widget.mouseMoveEvent(MiddleEvent(22.0, 34.0))
+        assert widget.cursor().shape() == Qt.CursorShape.ClosedHandCursor
+        widget.mouseReleaseEvent(MiddleEvent(22.0, 34.0))
+        assert widget.cursor().shape() == Qt.CursorShape.BlankCursor
+
+        assert widget.center_lon < start_lon
+        assert widget.center_lat == pytest.approx(start_lat)
+        assert widget.is_dragging is False
     finally:
         window.close()
 
