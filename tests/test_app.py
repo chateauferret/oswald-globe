@@ -85,6 +85,9 @@ def test_create_window(qapp, tmp_path: Path):
         "Open",
         "Save",
         "Save As...",
+        "Import",
+        "Export",
+        "Export As...",
         "Settings",
     ]
     assert window._edit_menu is not None
@@ -515,18 +518,42 @@ def test_middle_drag_pans_globe_in_paint_mode(qapp, monkeypatch: pytest.MonkeyPa
         window.close()
 
 
-def test_open_heightfield_dialog_configuration(qapp, tmp_path: Path):
+def test_open_heightfield_dialog_configuration(qapp):
+    window = create_window()
+
+    dialog = window._create_open_heightfield_dialog()
+
+    assert dialog.acceptMode() == dialog.AcceptMode.AcceptOpen
+    assert dialog.fileMode() == dialog.FileMode.ExistingFile
+    assert dialog.nameFilters()[0].startswith("NumPy Arrays (")
+    assert "*.npy" in dialog.nameFilters()[0]
+    assert "*.npz" in dialog.nameFilters()[0]
+
+    window.close()
+
+
+def test_import_tiff_dialog_configuration(qapp):
+    window = create_window()
+
+    dialog = window._create_import_tiff_dialog()
+
+    assert dialog.acceptMode() == dialog.AcceptMode.AcceptOpen
+    assert dialog.fileMode() == dialog.FileMode.ExistingFile
+    assert dialog.nameFilters()[0].startswith("TIFF Images (")
+    assert "*.tif" in dialog.nameFilters()[0]
+    assert "*.tiff" in dialog.nameFilters()[0]
+
+    window.close()
+
+
+def test_open_heightfield_dialog_excludes_tiff(qapp, tmp_path: Path):
     tif_path = tmp_path / "globe.tif"
     Image.fromarray(np.zeros((32, 64), dtype=np.float32)).save(tif_path)
     window = create_window(heightfield=tif_path, mesh_min_level=1, mesh_max_level=2, mesh_threshold=200.0)
 
     dialog = window._create_open_heightfield_dialog()
 
-    assert dialog.acceptMode() == dialog.AcceptMode.AcceptOpen
-    assert dialog.fileMode() == dialog.FileMode.ExistingFile
-    assert dialog.nameFilters()[0].startswith("Image Files (")
-    assert "*.tif" in dialog.nameFilters()[0]
-    assert "*.png" in dialog.nameFilters()[0]
+    assert "*.tif" not in dialog.nameFilters()[0]
 
     window.close()
 
@@ -568,19 +595,19 @@ def test_open_heightfield_cancel_is_noop(qapp, tmp_path: Path, monkeypatch: pyte
     window.close()
 
 
-def test_open_heightfield_loads_selected_image(qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_open_heightfield_loads_selected_numpy_array(qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     original_path = tmp_path / "original.tif"
-    replacement_path = tmp_path / "replacement.png"
+    replacement_path = tmp_path / "replacement.npy"
 
     Image.fromarray(np.zeros((32, 64), dtype=np.float32)).save(original_path)
-    replacement_data = np.linspace(0, 255, 64 * 128, dtype=np.uint8).reshape(64, 128)
-    Image.fromarray(replacement_data, mode="L").save(replacement_path)
+    replacement_data = np.linspace(-1000, 3000, 64 * 128, dtype=np.float32).reshape(64, 128)
+    np.save(replacement_path, replacement_data)
 
     window = create_window(heightfield=original_path, mesh_min_level=1, mesh_max_level=3, mesh_threshold=50.0)
     original_viewer = window.viewer
     original_mesh = original_viewer.mesh_grid
     built_mesh = IcosphereGrid.from_equirectangular(
-        load_elevation(replacement_path),
+        replacement_data,
         min_level=1,
         max_level=3,
         threshold=50.0,
@@ -606,4 +633,53 @@ def test_open_heightfield_loads_selected_image(qapp, tmp_path: Path, monkeypatch
     assert window.viewer.mesh_grid is built_mesh
     assert window.viewer.data.shape == replacement_data.shape
 
+    window.close()
+
+
+def test_import_tiff_builds_icosphere_from_equirectangular_raster(
+    qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    tiff_path = tmp_path / "world.tif"
+    Image.fromarray(np.zeros((32, 64), dtype=np.float32)).save(tiff_path)
+    elevation = np.arange(32 * 64, dtype=np.float32).reshape(32, 64)
+    window = create_window(mesh_min_level=1, mesh_max_level=2)
+
+    class AcceptDialog:
+        def exec(self):
+            return QFileDialog.DialogCode.Accepted
+
+        def selectedFiles(self):
+            return [str(tiff_path)]
+
+    load_args = []
+    monkeypatch.setattr(window, "_create_import_tiff_dialog", lambda: AcceptDialog())
+    monkeypatch.setattr("oswald_globe.globe_main_window.load_elevation", lambda path: elevation)
+    monkeypatch.setattr(
+        window,
+        "_start_heightfield_load",
+        lambda path, data: load_args.append((path, data)),
+    )
+
+    window.import_tiff()
+
+    assert load_args[0][0] == tiff_path
+    np.testing.assert_array_equal(load_args[0][1], elevation)
+    window.close()
+
+
+def test_export_tiff_rasterizes_icosphere_to_equirectangular_map(qapp, tmp_path: Path):
+    source_path = tmp_path / "source.tif"
+    Image.fromarray(np.zeros((32, 64), dtype=np.float32)).save(source_path)
+    window = create_window(heightfield=source_path, mesh_min_level=1, mesh_max_level=2)
+    grid = window.viewer.gl_widget.mesh_grid
+    assert grid is not None
+    grid.get_layer("elevation").values[:] = 123.5
+    output_path = tmp_path / "export.tif"
+
+    window._export_tiff(output_path)
+
+    with Image.open(output_path) as exported:
+        raster = np.asarray(exported, dtype=np.float32)
+    assert raster.shape == (32, 64)
+    np.testing.assert_allclose(raster, 123.5, atol=1e-4)
     window.close()

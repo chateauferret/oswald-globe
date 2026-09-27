@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 from PySide6.QtCore import QSize
 import numpy as np
+from PIL import Image
 from PySide6.QtCore import QDir, QSettings, QThread, Qt, QTimer, Slot
-from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QIcon, QImageReader, QKeySequence, QLinearGradient, QPainter, QPixmap, QSurfaceFormat
+from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QIcon, QKeySequence, QLinearGradient, QPainter, QPixmap, QSurfaceFormat
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -62,6 +63,7 @@ class GlobeMainWindow(QMainWindow):
         self._mesh_max_level = mesh_max_level
         self._mesh_threshold = mesh_threshold
         self._save_path: Optional[Path] = None
+        self._export_path: Optional[Path] = None
         self._settings = settings or APP_SETTINGS
         self._legend_action_group: Optional[QActionGroup] = None
         self._tool_action_group: Optional[QActionGroup] = None
@@ -110,6 +112,20 @@ class GlobeMainWindow(QMainWindow):
         save_as_action = QAction("Save As...", self)
         save_as_action.triggered.connect(self.save_heightfield_as)
         self._file_menu.addAction(save_as_action)
+
+        self._file_menu.addSeparator()
+
+        import_action = QAction("Import", self)
+        import_action.triggered.connect(self.import_tiff)
+        self._file_menu.addAction(import_action)
+
+        export_action = QAction("Export", self)
+        export_action.triggered.connect(self.export_tiff)
+        self._file_menu.addAction(export_action)
+
+        export_as_action = QAction("Export As...", self)
+        export_as_action.triggered.connect(self.export_tiff_as)
+        self._file_menu.addAction(export_as_action)
 
         self._file_menu.addSeparator()
 
@@ -423,6 +439,7 @@ class GlobeMainWindow(QMainWindow):
             self.setWindowTitle(view_title)
             self._heightfield = None
             self._save_path = None
+            self._export_path = None
             self._sync_tool_mode_to_viewer()
             return
 
@@ -430,7 +447,12 @@ class GlobeMainWindow(QMainWindow):
         if not heightfield.is_file():
             raise FileNotFoundError(f"Heightfield not found: {heightfield}")
 
-        elevation_data = load_elevation(heightfield) if elevation is None else np.asarray(elevation, dtype=np.float32)
+        if elevation is not None:
+            elevation_data = np.asarray(elevation, dtype=np.float32)
+        elif heightfield.suffix.lower() in (".npy", ".npz"):
+            elevation_data = self._load_numpy_heightfield(heightfield)
+        else:
+            elevation_data = load_elevation(heightfield)
         viewer = GlobeViewer(
             elevation_data,
             cmap=load_topo_cmap(self._ensure_current_legend(), name=self._legend_name(self._current_legend)),
@@ -455,6 +477,7 @@ class GlobeMainWindow(QMainWindow):
         self.setWindowTitle(heightfield.stem)
         self._heightfield = heightfield
         self._save_path = None
+        self._export_path = None
         self._sync_tool_mode_to_viewer()
 
     def _current_grid_settings(self) -> Dict[str, Dict[str, Union[bool, float, QColor]]]:
@@ -547,20 +570,23 @@ class GlobeMainWindow(QMainWindow):
         self._settings.sync()
         super().closeEvent(event)
 
-    def _image_file_filter(self) -> str:
-        extensions = {bytes(fmt).decode("ascii").lower() for fmt in QImageReader.supportedImageFormats()}
-        extensions.update({"tif", "tiff"})
-        extensions = sorted(extensions)
-        patterns = " ".join(f"*.{extension}" for extension in extensions)
-        return f"Image Files ({patterns});;All Files (*)"
-
     def _create_open_heightfield_dialog(self) -> QFileDialog:
         starting_dir = self._heightfield.parent if self._heightfield is not None else Path.cwd()
         dialog = QFileDialog(self, "Open Heightfield", str(starting_dir))
         dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dialog.setNameFilter(self._image_file_filter())
+        dialog.setNameFilter("NumPy Arrays (*.npy *.npz);;All Files (*)")
         return dialog
+
+    @staticmethod
+    def _load_numpy_heightfield(path: Path) -> np.ndarray:
+        if path.suffix.lower() == ".npy":
+            return np.asarray(np.load(path), dtype=np.float32)
+        if path.suffix.lower() == ".npz":
+            with np.load(path) as archive:
+                key = "elevation" if "elevation" in archive.files else archive.files[0]
+                return np.asarray(archive[key], dtype=np.float32)
+        raise ValueError(f"Unsupported NumPy heightfield format: {path.suffix}")
 
     def open_heightfield(self) -> None:
         dialog = self._create_open_heightfield_dialog()
@@ -577,12 +603,49 @@ class GlobeMainWindow(QMainWindow):
         progress_dialog.start_stage("loading-heightfield")
         progress_dialog.show()
         try:
+            elevation = self._load_numpy_heightfield(heightfield)
+        except Exception as exc:
+            progress_dialog.close()
+            progress_dialog.deleteLater()
+            self._progress_dialog = None
+            QMessageBox.critical(self, "Failed to open heightfield", str(exc))
+            return
+        progress_dialog.finish_stage("loading-heightfield")
+        self._start_heightfield_load(heightfield, elevation)
+
+    def _create_import_tiff_dialog(self) -> QFileDialog:
+        starting_dir = self._heightfield.parent if self._heightfield is not None else Path.cwd()
+        dialog = QFileDialog(self, "Import TIFF", str(starting_dir))
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setNameFilter("TIFF Images (*.tif *.tiff);;All Files (*)")
+        return dialog
+
+    def import_tiff(self) -> None:
+        dialog = self._create_import_tiff_dialog()
+        if dialog.exec() != QFileDialog.DialogCode.Accepted:
+            return
+
+        selected_files = dialog.selectedFiles()
+        if not selected_files:
+            return
+
+        heightfield = Path(selected_files[0])
+        if heightfield.suffix.lower() not in (".tif", ".tiff"):
+            QMessageBox.critical(self, "Failed to import TIFF", "Select a .tif or .tiff file.")
+            return
+
+        progress_dialog = IcosphereProgressDialog(self)
+        self._progress_dialog = progress_dialog
+        progress_dialog.start_stage("loading-heightfield")
+        progress_dialog.show()
+        try:
             elevation = load_elevation(heightfield)
         except Exception as exc:
             progress_dialog.close()
             progress_dialog.deleteLater()
             self._progress_dialog = None
-            QMessageBox.critical(self, "Failed to load heightfield", str(exc))
+            QMessageBox.critical(self, "Failed to import TIFF", str(exc))
             return
         progress_dialog.finish_stage("loading-heightfield")
         self._start_heightfield_load(heightfield, elevation)
@@ -599,7 +662,7 @@ class GlobeMainWindow(QMainWindow):
             self,
             "Save Heightfield",
             str(default_path),
-            "NumPy Array (*.npy);;Compressed NumPy Array (*.npz);;TIFF (*.tif *.tiff)",
+            "NumPy Array (*.npy);;Compressed NumPy Array (*.npz)",
         )
         if file_name:
             self._save_path = Path(file_name)
@@ -614,10 +677,44 @@ class GlobeMainWindow(QMainWindow):
             np.save(path, data)
         elif suffix == ".npz":
             np.savez_compressed(path, elevation=data)
-        elif suffix in (".tif", ".tiff"):
-            Image.fromarray(np.asarray(data, dtype=np.float32)).save(path)
         else:
             raise ValueError(f"Unsupported save format: {path.suffix}")
+
+    def export_tiff(self) -> None:
+        if self._export_path is None:
+            self.export_tiff_as()
+            return
+        self._export_tiff(self._export_path)
+
+    def export_tiff_as(self) -> None:
+        default_path = (
+            self._heightfield.with_suffix(".tif")
+            if self._heightfield is not None
+            else Path("sea_level.tif")
+        )
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export TIFF",
+            str(default_path),
+            "TIFF Image (*.tif *.tiff)",
+        )
+        if file_name:
+            export_path = Path(file_name)
+            if export_path.suffix.lower() not in (".tif", ".tiff"):
+                if export_path.suffix:
+                    QMessageBox.critical(self, "Failed to export TIFF", "Choose a .tif or .tiff file.")
+                    return
+                export_path = export_path.with_suffix(".tif")
+            self._export_path = export_path
+            self._export_tiff(self._export_path)
+
+    def _export_tiff(self, path: Path) -> None:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("TIFF export requires an icosphere grid.")
+        height, width = self.viewer.gl_widget.raw_data.shape
+        raster = mesh_grid.to_equirectangular(height, width)
+        Image.fromarray(np.asarray(raster, dtype=np.float32)).save(path, format="TIFF")
 
 
 def create_window(
