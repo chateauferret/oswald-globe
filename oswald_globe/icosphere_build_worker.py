@@ -7,7 +7,7 @@ from threading import Event
 import numpy as np
 from PySide6.QtCore import QObject, Signal, Slot
 
-from oswald_globe.icosphere import IcosphereBuildCancelled, IcosphereGrid
+from oswald_globe.icosphere_grid import IcosphereBuildCancelled, IcosphereGrid
 
 
 class IcosphereBuildWorker(QObject):

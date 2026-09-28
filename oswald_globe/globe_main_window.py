@@ -27,7 +27,7 @@ try:
     from .app_support import APP_SETTINGS, DEFAULT_HEIGHTFIELD, empty_globe_elevation, generic_icosphere_mesh, load_elevation
     from .colormap import DEFAULT_TOPO_LEGEND, LEGENDS_DIR, load_topo_cmap
     from .globe_viewer import GlobeViewer
-    from .icosphere import IcosphereGrid
+    from .icosphere_grid import IcosphereGrid
     from .icosphere_build_worker import IcosphereBuildWorker
     from .icosphere_progress_dialog import IcosphereProgressDialog
     from .paint_tool import PaintTool
@@ -39,7 +39,7 @@ except ImportError:  # pragma: no cover - supports running as a script
     from oswald_globe.app_support import APP_SETTINGS, DEFAULT_HEIGHTFIELD, empty_globe_elevation, generic_icosphere_mesh, load_elevation
     from oswald_globe.colormap import DEFAULT_TOPO_LEGEND, LEGENDS_DIR, load_topo_cmap
     from oswald_globe.globe_viewer import GlobeViewer
-    from oswald_globe.icosphere import IcosphereGrid
+    from oswald_globe.icosphere_grid import IcosphereGrid
     from oswald_globe.icosphere_build_worker import IcosphereBuildWorker
     from oswald_globe.icosphere_progress_dialog import IcosphereProgressDialog
     from oswald_globe.paint_tool import PaintTool

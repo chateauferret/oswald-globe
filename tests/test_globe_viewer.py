@@ -11,7 +11,7 @@ except ImportError:
 
 from oswald_globe.colormap import load_topo_cmap
 from oswald_globe.globe_viewer import GlobeViewer, globe_viewer
-from oswald_globe.icosphere import IcosphereGrid
+from oswald_globe.icosphere_grid import IcosphereGrid
 
 
 def test_globe_viewer_numpy_array(qapp):

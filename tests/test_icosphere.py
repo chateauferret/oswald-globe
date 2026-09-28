@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from oswald_globe.icosphere import IcosphereBuildCancelled, IcosphereGrid, LayerLegend, _xyz_to_latlon
+from oswald_globe.icosphere_grid import IcosphereBuildCancelled, IcosphereGrid, LayerLegend, _xyz_to_latlon
 
 
 def _bump_map(height=181, width=361):

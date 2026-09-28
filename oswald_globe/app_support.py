@@ -10,7 +10,7 @@ from PIL import Image
 from PySide6.QtCore import QSettings
 from PySide6.QtGui import QColor
 
-from oswald_globe.icosphere import IcosphereGrid
+from oswald_globe.icosphere_grid import IcosphereGrid
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HEIGHTFIELD = PACKAGE_ROOT / "data" / "heightfield.tif"

@@ -27,7 +27,7 @@ except ImportError:
 
 from oswald_globe.colormap import load_topo_cmap
 from oswald_globe.globe_widget import GlobeGLWidget
-from oswald_globe.icosphere import IcosphereGrid
+from oswald_globe.icosphere_grid import IcosphereGrid
 
 STYLE_FILE = Path(__file__).resolve().parent / "styles" / "style.qss"
 DEFAULT_COLORMAP_VMIN = -32767.0

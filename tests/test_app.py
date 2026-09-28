@@ -10,7 +10,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QComboBox, QFileDialog, QSlider, QSpinBox, QToolTip
 
 from oswald_globe.app import IcosphereProgressDialog, create_window, load_elevation
-from oswald_globe.icosphere import IcosphereGrid
+from oswald_globe.icosphere_grid import IcosphereGrid
 from oswald_globe.undo_stack import BrushPaintCommand, UndoStack
 
 

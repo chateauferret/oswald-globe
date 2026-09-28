@@ -8,7 +8,7 @@ from typing import Callable
 
 import numpy as np
 
-from oswald_globe.icosphere import IcosphereGrid
+from oswald_globe.icosphere_grid import IcosphereGrid
 
 
 @dataclass(slots=True)

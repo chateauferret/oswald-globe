@@ -102,7 +102,7 @@ from PySide6.QtWidgets import (
 )
 
 from oswald_globe.colormap import load_topo_cmap
-from oswald_globe.icosphere import IcosphereGrid
+from oswald_globe.icosphere_grid import IcosphereGrid
 from oswald_globe.relief_map import get_relief_map
 from oswald_globe.utils import (
     get_graticule_step,

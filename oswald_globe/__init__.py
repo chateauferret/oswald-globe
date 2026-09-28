@@ -14,5 +14,5 @@ def __getattr__(name: str):
         module = import_module("oswald_globe.globe_viewer")
         return getattr(module, name)
     if name == "IcosphereGrid":
-        return import_module("oswald_globe.icosphere").IcosphereGrid
+        return import_module("oswald_globe.icosphere_grid").IcosphereGrid
     raise AttributeError(f"module 'oswald_globe' has no attribute {name!r}")
