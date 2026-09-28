@@ -17,7 +17,7 @@ from __future__ import annotations
 import sys
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -676,3 +676,170 @@ class IcosphereGrid:
         lon_grid, lat_grid = np.meshgrid(lon, lat)
         flat_vals = self.sample(lat_grid.ravel(), lon_grid.ravel(), k=k)
         return flat_vals.reshape(height, width)
+
+    def _serialize_face_tree(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        face_vertices: List[Tuple[int, int, int]] = []
+        face_levels: List[int] = []
+        face_children: List[List[int]] = []
+
+        def visit(face: _Face) -> int:
+            face_index = len(face_vertices)
+            face_vertices.append(tuple(int(vertex) for vertex in face.v))
+            face_levels.append(int(face.level))
+            face_children.append([-1, -1, -1, -1])
+            if face.children is not None:
+                if len(face.children) != 4:
+                    raise ValueError("Serialized icosphere faces must have either 0 or 4 children.")
+                child_indices = [visit(child) for child in face.children]
+                face_children[face_index] = child_indices
+            return face_index
+
+        root_indices = [visit(root) for root in self.roots]
+        return (
+            np.asarray(face_vertices, dtype=np.int64),
+            np.asarray(face_levels, dtype=np.int64),
+            np.asarray(face_children, dtype=np.int64),
+            np.asarray(root_indices, dtype=np.int64),
+        )
+
+    def to_serialized_state(self) -> Dict[str, Any]:
+        """Return a fully materialized representation of the mesh geometry and layers."""
+        face_vertices, face_levels, face_children, root_indices = self._serialize_face_tree()
+        edge_items = sorted(self._edge_midpoints.items())
+        if edge_items:
+            edge_midpoint_keys = np.asarray([key for key, _ in edge_items], dtype=np.int64)
+            edge_midpoint_values = np.asarray([value for _, value in edge_items], dtype=np.int64)
+        else:
+            edge_midpoint_keys = np.empty((0, 2), dtype=np.int64)
+            edge_midpoint_values = np.empty((0,), dtype=np.int64)
+
+        layer_metadata = []
+        layer_values: Dict[str, np.ndarray] = {}
+        for layer_index, layer_name in enumerate(self.layer_names()):
+            layer = self._layers[layer_name]
+            layer_key = f"layer_values_{layer_index}"
+            layer_metadata.append(
+                {
+                    "name": layer.name,
+                    "description": layer.description,
+                    "visible": layer.visible,
+                    "opacity": layer.opacity,
+                    "legend_name": None if layer.legend is None else layer.legend.name,
+                    "z_index": layer.z_index,
+                    "values_key": layer_key,
+                }
+            )
+            layer_values[layer_key] = np.asarray(layer.values, dtype=np.float64)
+
+        return {
+            "vertices": np.asarray(self.vertices, dtype=np.float64),
+            "face_vertices": face_vertices,
+            "face_levels": face_levels,
+            "face_children": face_children,
+            "root_indices": root_indices,
+            "edge_midpoint_keys": edge_midpoint_keys,
+            "edge_midpoint_values": edge_midpoint_values,
+            "layer_metadata": layer_metadata,
+            **layer_values,
+        }
+
+    @classmethod
+    def from_serialized_state(cls, state: Mapping[str, object]) -> "IcosphereGrid":
+        """Rebuild an icosphere grid from a serialized geometry/layer snapshot."""
+        vertices = np.asarray(state["vertices"], dtype=np.float64)
+        if vertices.ndim != 2 or vertices.shape[1] != 3:
+            raise ValueError(f"Serialized vertices must have shape (N, 3), got {vertices.shape}.")
+
+        face_vertices = np.asarray(state["face_vertices"], dtype=np.int64)
+        face_levels = np.asarray(state["face_levels"], dtype=np.int64)
+        face_children = np.asarray(state["face_children"], dtype=np.int64)
+        root_indices = np.asarray(state["root_indices"], dtype=np.int64)
+        if face_vertices.ndim != 2 or face_vertices.shape[1] != 3:
+            raise ValueError(
+                f"Serialized face vertices must have shape (N, 3), got {face_vertices.shape}."
+            )
+        if face_levels.shape != (face_vertices.shape[0],):
+            raise ValueError(
+                "Serialized face levels must contain one entry per serialized face, "
+                f"got {face_levels.shape} for {face_vertices.shape[0]} faces."
+            )
+        if face_children.shape != (face_vertices.shape[0], 4):
+            raise ValueError(
+                "Serialized face child indices must have shape (N, 4), "
+                f"got {face_children.shape}."
+            )
+
+        layer_metadata_obj = state.get("layer_metadata")
+        if not isinstance(layer_metadata_obj, Sequence):
+            raise ValueError("Serialized layer metadata must be a sequence of layer descriptors.")
+        layer_metadata = list(layer_metadata_obj)
+
+        grid = cls()
+        grid._vertices = [np.asarray(vertex, dtype=np.float64) for vertex in vertices]
+        grid._layers = OrderedDict()
+
+        for descriptor in layer_metadata:
+            if not isinstance(descriptor, Mapping):
+                raise ValueError(f"Invalid serialized layer descriptor: {descriptor!r}")
+            layer_name = str(descriptor["name"])
+            values_key = str(descriptor["values_key"])
+            if values_key not in state:
+                raise ValueError(
+                    f"Serialized layer {layer_name!r} is missing its value array {values_key!r}."
+                )
+            legend_name = descriptor.get("legend_name")
+            grid.add_layer(
+                layer_name,
+                np.asarray(state[values_key], dtype=np.float64),
+                description=str(descriptor.get("description", "")),
+                visible=bool(descriptor.get("visible", True)),
+                opacity=float(descriptor.get("opacity", 100.0)),
+                legend=None if legend_name is None else str(legend_name),
+                z_index=int(descriptor.get("z_index", len(grid._layers))),
+            )
+
+        if "elevation" not in grid._layers:
+            raise ValueError("Serialized icosphere grid must include an 'elevation' layer.")
+
+        edge_midpoint_keys = np.asarray(
+            state.get("edge_midpoint_keys", np.empty((0, 2), dtype=np.int64)),
+            dtype=np.int64,
+        )
+        edge_midpoint_values = np.asarray(
+            state.get("edge_midpoint_values", np.empty((0,), dtype=np.int64)),
+            dtype=np.int64,
+        )
+        if edge_midpoint_keys.size == 0:
+            grid._edge_midpoints = {}
+        else:
+            if edge_midpoint_keys.ndim != 2 or edge_midpoint_keys.shape[1] != 2:
+                raise ValueError(
+                    "Serialized edge midpoint keys must have shape (N, 2), "
+                    f"got {edge_midpoint_keys.shape}."
+                )
+            if edge_midpoint_values.shape != (edge_midpoint_keys.shape[0],):
+                raise ValueError(
+                    "Serialized edge midpoint values must contain one entry per edge key, "
+                    f"got {edge_midpoint_values.shape} for {edge_midpoint_keys.shape[0]} keys."
+                )
+            grid._edge_midpoints = {
+                (int(key[0]), int(key[1])): int(value)
+                for key, value in zip(edge_midpoint_keys, edge_midpoint_values)
+            }
+
+        nodes = [
+            _Face((int(vertices_row[0]), int(vertices_row[1]), int(vertices_row[2])), int(level))
+            for vertices_row, level in zip(face_vertices, face_levels)
+        ]
+        for node_index, child_indices in enumerate(face_children):
+            valid_children = [int(child_index) for child_index in child_indices if int(child_index) >= 0]
+            if valid_children:
+                if len(valid_children) != 4:
+                    raise ValueError(
+                        "Serialized non-leaf faces must reference exactly 4 children, "
+                        f"got {valid_children!r}."
+                    )
+                nodes[node_index].children = [nodes[child_index] for child_index in valid_children]
+        grid.roots = [nodes[int(root_index)] for root_index in root_indices]
+        grid._invalidate_caches()
+        return grid

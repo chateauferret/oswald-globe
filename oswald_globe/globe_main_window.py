@@ -4,20 +4,34 @@ from __future__ import annotations
 
 import argparse
 import sys
+from threading import Event
 from pathlib import Path
 from typing import Dict, Optional, Union
 from PySide6.QtCore import QSize
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QDir, QSettings, QThread, Qt, QTimer, Slot
+from PySide6.QtCore import QDir, QObject, QSettings, QThread, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QIcon, QKeySequence, QLinearGradient, QPainter, QPixmap, QSurfaceFormat
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
+    QVBoxLayout,
+    QWidget,
 )
+
+try:
+    import rasterio
+    from rasterio.transform import from_origin
+except ImportError:
+    rasterio = None
+    from_origin = None
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -31,6 +45,7 @@ try:
     from .icosphere_build_worker import IcosphereBuildWorker
     from .icosphere_progress_dialog import IcosphereProgressDialog
     from .paint_tool import PaintTool
+    from .project import Project
     from .settings_dialog import SettingsDialog
     from .tool import NavigateTool, Tool
     from .undo_stack import BrushPaintCommand, UndoStack
@@ -43,9 +58,322 @@ except ImportError:  # pragma: no cover - supports running as a script
     from oswald_globe.icosphere_build_worker import IcosphereBuildWorker
     from oswald_globe.icosphere_progress_dialog import IcosphereProgressDialog
     from oswald_globe.paint_tool import PaintTool
+    from oswald_globe.project import Project
     from oswald_globe.settings_dialog import SettingsDialog
     from oswald_globe.tool import NavigateTool, Tool
     from oswald_globe.undo_stack import BrushPaintCommand, UndoStack
+
+
+def _write_tiff_export(path: Path, raster: np.ndarray) -> None:
+    clipped = np.clip(np.asarray(raster, dtype=np.float64), -32767.0, 32767.0)
+    scaled = np.rint((clipped + 32767.0) * (65535.0 / 65534.0)).astype(np.uint16)
+    if rasterio is not None and from_origin is not None:
+        pixel_width = 360.0 / 4096.0
+        pixel_height = 180.0 / 2048.0
+        transform = from_origin(-180.0, 90.0, pixel_width, pixel_height)
+        with rasterio.open(
+            path,
+            "w",
+            driver="GTiff",
+            height=2048,
+            width=4096,
+            count=1,
+            dtype=np.uint16,
+            crs="EPSG:4326",
+            transform=transform,
+            nodata=None,
+        ) as dataset:
+            dataset.write(scaled, 1)
+        return
+
+    Image.fromarray(scaled).save(path, format="TIFF")
+
+
+def _load_tiff_import_raster(path: Path) -> np.ndarray:
+    def _normalize_luminance(array: np.ndarray) -> np.ndarray:
+        arr = np.asarray(array)
+        if arr.ndim == 3:
+            if arr.shape[2] == 1:
+                arr = arr[:, :, 0]
+            else:
+                rgb = arr[:, :, :3].astype(np.float32, copy=False)
+                max_channel_value = (
+                    float(np.iinfo(arr.dtype).max)
+                    if np.issubdtype(arr.dtype, np.integer)
+                    else 1.0
+                )
+                if max_channel_value <= 0.0:
+                    raise ValueError(f"Unsupported TIFF channel range for {path}.")
+                rgb /= max_channel_value
+                return np.clip(
+                    0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1] + 0.0722 * rgb[:, :, 2],
+                    0.0,
+                    1.0,
+                )
+
+        if arr.ndim != 2:
+            raise ValueError(f"Expected TIFF raster to be 2D or RGB/RGBA, got shape {arr.shape}.")
+
+        grayscale = arr.astype(np.float32, copy=False)
+        if np.issubdtype(arr.dtype, np.integer):
+            max_value = float(np.iinfo(arr.dtype).max)
+        else:
+            finite = grayscale[np.isfinite(grayscale)]
+            max_value = float(np.nanmax(finite)) if finite.size else 0.0
+            if max_value <= 0.0:
+                max_value = 1.0
+        if max_value <= 0.0:
+            raise ValueError(f"Unsupported TIFF grayscale range for {path}.")
+        return np.clip(grayscale / max_value, 0.0, 1.0)
+
+    with Image.open(path) as image:
+        source = image
+        if image.mode == "P":
+            source = image.convert("RGBA")
+        normalized = _normalize_luminance(np.asarray(source))
+        width, height = int(normalized.shape[1]), int(normalized.shape[0])
+        if width <= 0 or height <= 0:
+            raise ValueError(f"TIFF image has invalid size: {width}x{height}")
+        if width != height * 2:
+            if width / float(height) >= 2.0:
+                new_size = (width, max(1, int(round(width / 2.0))))
+            else:
+                new_size = (max(1, int(round(height * 2.0))), height)
+            resized = Image.fromarray(normalized.astype(np.float32), mode="F").resize(
+                new_size,
+                resample=Image.Resampling.BILINEAR,
+            )
+            normalized = np.asarray(resized, dtype=np.float32)
+
+    return normalized * 65534.0 - 32767.0
+
+
+class TiffExportWorker(QObject):
+    progressMessageChanged = Signal(str)
+    progressChanged = Signal(int, int)
+    completed = Signal()
+    failed = Signal(object)
+    cancelled = Signal()
+
+    def __init__(self, mesh_grid: IcosphereGrid, export_path: Path):
+        super().__init__()
+        self._mesh_grid = mesh_grid
+        self._export_path = Path(export_path)
+        self._cancel_event = Event()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.progressMessageChanged.emit("Rasterizing icosphere data")
+            self.progressChanged.emit(0, 100)
+            raster = self._rasterize_with_progress(height=2048, width=4096)
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+                return
+            self.progressMessageChanged.emit("Writing TIFF file")
+            self.progressChanged.emit(95, 100)
+            _write_tiff_export(self._export_path, raster)
+            self.progressChanged.emit(100, 100)
+        except Exception as exc:
+            self.failed.emit(exc)
+            return
+        self.completed.emit()
+
+    def _rasterize_with_progress(self, *, height: int, width: int, chunk_rows: int = 64) -> np.ndarray:
+        rows = np.arange(height)
+        cols = np.arange(width)
+        lat = 90.0 - (rows + 0.5) / height * 180.0
+        lon = (cols + 0.5) / width * 360.0 - 180.0
+        lon_grid = np.broadcast_to(lon, (chunk_rows, width))
+        raster = np.empty((height, width), dtype=np.float64)
+        total_rows = max(1, height)
+
+        for start in range(0, height, chunk_rows):
+            if self._cancel_event.is_set():
+                break
+            end = min(start + chunk_rows, height)
+            chunk_height = end - start
+            lat_chunk = lat[start:end]
+            lat_grid = np.repeat(lat_chunk[:, None], width, axis=1)
+            sampled = self._mesh_grid.sample(
+                lat_grid.ravel(),
+                lon_grid[:chunk_height].ravel(),
+                k=8,
+            ).reshape(chunk_height, width)
+            raster[start:end, :] = sampled
+            rasterize_progress = int(round((end / total_rows) * 95.0))
+            self.progressChanged.emit(rasterize_progress, 100)
+
+        return raster
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+
+class TiffImportWorker(QObject):
+    progressMessageChanged = Signal(str)
+    progressChanged = Signal(int, int)
+    completed = Signal(object)
+    failed = Signal(object)
+    cancelled = Signal()
+
+    _STAGE_LABELS = {
+        "creating-faces": "Creating icosphere faces",
+        "balancing-faces": "Balancing icosphere faces",
+        "populating-faces": "Populating globe data",
+    }
+
+    def __init__(self, import_path: Path, *, min_level: int, max_level: int, threshold: float):
+        super().__init__()
+        self._import_path = Path(import_path)
+        self._min_level = int(min_level)
+        self._max_level = int(max_level)
+        self._threshold = float(threshold)
+        self._cancel_event = Event()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.progressMessageChanged.emit("Loading TIFF file")
+            self.progressChanged.emit(0, 100)
+            raster = _load_tiff_import_raster(self._import_path)
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+                return
+
+            self.progressMessageChanged.emit("Mapping TIFF onto icosphere data")
+            grid = IcosphereGrid.from_equirectangular(
+                raster,
+                min_level=self._min_level,
+                max_level=self._max_level,
+                threshold=self._threshold,
+                progress_callback=self._on_grid_progress,
+                is_cancelled=self._cancel_event.is_set,
+            )
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+                return
+
+            self.progressChanged.emit(100, 100)
+        except Exception as exc:
+            self.failed.emit(exc)
+            return
+
+        self.completed.emit((raster, grid))
+
+    def _on_grid_progress(self, phase: str, done: int, total: int) -> None:
+        self.progressMessageChanged.emit(self._STAGE_LABELS.get(phase, "Importing TIFF"))
+        stage_starts = {
+            "creating-faces": 10.0,
+            "balancing-faces": 70.0,
+            "populating-faces": 85.0,
+        }
+        stage_widths = {
+            "creating-faces": 60.0,
+            "balancing-faces": 15.0,
+            "populating-faces": 15.0,
+        }
+        start = stage_starts.get(phase, 10.0)
+        width = stage_widths.get(phase, 0.0)
+        if total <= 0:
+            fraction = 0.0 if done <= 0 else 1.0
+        else:
+            bounded_total = max(1, int(total))
+            fraction = min(max(float(done) / bounded_total, 0.0), 1.0)
+        percent = int(round(start + width * fraction))
+        self.progressChanged.emit(percent, 100)
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+
+class TiffExportProgressDialog(QDialog):
+    cancelRequested = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Exporting TIFF")
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        self._status_label = QLabel("Preparing export", self)
+        self._progress_bar = QProgressBar(self)
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setFormat("%p%")
+
+        buttons = QDialogButtonBox(self)
+        self._cancel_button = buttons.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        self._cancel_button.clicked.connect(self.cancel)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._status_label)
+        layout.addWidget(self._progress_bar)
+        layout.addWidget(buttons)
+
+    def cancel(self) -> None:
+        self.cancelRequested.emit()
+
+    def set_status(self, message: str) -> None:
+        self._status_label.setText(message)
+
+    def update_progress(self, done: int, total: int) -> None:
+        maximum = max(1, int(total))
+        bounded = max(0, min(int(done), maximum))
+        self._progress_bar.setRange(0, maximum)
+        self._progress_bar.setValue(bounded)
+
+    def show_cancelling(self) -> None:
+        self._cancel_button.setEnabled(False)
+        self._status_label.setText("Cancelling export")
+        self.setWindowTitle("Cancelling TIFF Export")
+
+
+class TiffImportProgressDialog(QDialog):
+    cancelRequested = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Importing TIFF")
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        self._status_label = QLabel("Preparing import", self)
+        self._progress_bar = QProgressBar(self)
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setFormat("%p%")
+
+        buttons = QDialogButtonBox(self)
+        self._cancel_button = buttons.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        self._cancel_button.clicked.connect(self.cancel)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._status_label)
+        layout.addWidget(self._progress_bar)
+        layout.addWidget(buttons)
+
+    def cancel(self) -> None:
+        self.cancelRequested.emit()
+
+    def set_status(self, message: str) -> None:
+        self._status_label.setText(message)
+
+    def update_progress(self, done: int, total: int) -> None:
+        maximum = max(1, int(total))
+        bounded = max(0, min(int(done), maximum))
+        self._progress_bar.setRange(0, maximum)
+        self._progress_bar.setValue(bounded)
+
+    def show_cancelling(self) -> None:
+        self._cancel_button.setEnabled(False)
+        self._status_label.setText("Cancelling import")
+        self.setWindowTitle("Cancelling TIFF Import")
+
 
 class GlobeMainWindow(QMainWindow):
     def __init__(
@@ -62,12 +390,13 @@ class GlobeMainWindow(QMainWindow):
         self._mesh_min_level = mesh_min_level
         self._mesh_max_level = mesh_max_level
         self._mesh_threshold = mesh_threshold
+        self._project_metadata_dirty = False
         self._save_path: Optional[Path] = None
         self._export_path: Optional[Path] = None
         self._settings = settings or APP_SETTINGS
         self._legend_action_group: Optional[QActionGroup] = None
         self._tool_action_group: Optional[QActionGroup] = None
-        self._undo_stack = UndoStack(on_changed=self._sync_edit_actions)
+        self._undo_stack = UndoStack(on_changed=self._on_project_state_changed)
         self._tools: Dict[str, Tool] = {
             "navigate": NavigateTool(self),
             "paint": PaintTool(self),
@@ -84,6 +413,14 @@ class GlobeMainWindow(QMainWindow):
         self._load_thread: Optional[QThread] = None
         self._load_worker: Optional[IcosphereBuildWorker] = None
         self._progress_dialog: Optional[IcosphereProgressDialog] = None
+        self._import_thread: Optional[QThread] = None
+        self._import_worker: Optional[TiffImportWorker] = None
+        self._import_progress_dialog: Optional[TiffImportProgressDialog] = None
+        self._pending_import_path: Optional[Path] = None
+        self._export_thread: Optional[QThread] = None
+        self._export_worker: Optional[TiffExportWorker] = None
+        self._export_progress_dialog: Optional[TiffExportProgressDialog] = None
+        self._pending_export_path: Optional[Path] = None
         self._pending_heightfield: Optional[Path] = None
         self._pending_elevation: Optional[np.ndarray] = None
         self._pending_viewer: Optional[GlobeViewer] = None
@@ -100,6 +437,12 @@ class GlobeMainWindow(QMainWindow):
 
     def _build_menu_bar(self) -> None:
         self._file_menu = self.menuBar().addMenu("File")
+
+        new_action = QAction("New", self)
+        new_action.triggered.connect(self.new_project)
+        self._file_menu.addAction(new_action)
+
+        self._file_menu.addSeparator()
 
         open_action = QAction("Open", self)
         open_action.triggered.connect(self.open_heightfield)
@@ -168,6 +511,7 @@ class GlobeMainWindow(QMainWindow):
 
         self._view_menu = self.menuBar().addMenu("View")
         self._legend_menu = self._view_menu.addMenu("Legend")
+        self._legend_menu.setToolTipsVisible(True)
         self._legend_menu.aboutToShow.connect(self._populate_legend_menu)
         self._sync_edit_actions()
 
@@ -219,19 +563,58 @@ class GlobeMainWindow(QMainWindow):
         if self._redo_action is not None:
             self._redo_action.setEnabled(self._undo_stack.can_redo())
 
+    def _on_project_state_changed(self) -> None:
+        self._sync_edit_actions()
+        self.setWindowModified(self._has_unsaved_changes())
+
+    def _has_unsaved_changes(self) -> bool:
+        return not self._undo_stack.is_clean() or self._project_metadata_dirty
+
+    def _set_project_window_title(self, title: str) -> None:
+        self.setWindowTitle(f"{title}[*]")
+
+    def _mark_project_clean(self) -> None:
+        self._project_metadata_dirty = False
+        self._undo_stack.set_clean()
+
+    def _mark_project_metadata_dirty(self) -> None:
+        self._project_metadata_dirty = True
+        self._on_project_state_changed()
+
+    def _confirm_discard_or_save_changes(self, action_description: str) -> bool:
+        if not self._has_unsaved_changes():
+            return True
+
+        choice = QMessageBox.warning(
+            self,
+            "Unsaved project changes",
+            f"Do you want to save your changes before {action_description}?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if choice == QMessageBox.StandardButton.Cancel:
+            return False
+        if choice == QMessageBox.StandardButton.Discard:
+            return True
+        return self.save_heightfield()
+
     def _legend_name(self, legend_source: Union[str, Path]) -> str:
         return Path(str(legend_source).removeprefix(":/")).stem
 
     def _available_legend_sources(self) -> list[str]:
         resource_dir = QDir(":/legends")
         resource_legends = resource_dir.entryList(["*.txt"], QDir.Filter.Files, QDir.SortFlag.Name)
-        if resource_legends:
-            return [f":/legends/{legend}" for legend in resource_legends]
-
+        combined: list[str] = [f":/legends/{legend}" for legend in resource_legends]
         if LEGENDS_DIR.is_dir():
-            return [str(path) for path in sorted(LEGENDS_DIR.glob("*.txt"))]
+            combined.extend(str(path) for path in sorted(LEGENDS_DIR.glob("*.txt")))
 
-        return []
+        legends_by_name: dict[str, str] = {}
+        for legend in combined:
+            legends_by_name.setdefault(self._legend_name(legend), legend)
+
+        return [legends_by_name[name] for name in sorted(legends_by_name)]
 
     def _default_legend_source(self) -> str:
         legends = self._available_legend_sources()
@@ -299,7 +682,6 @@ class GlobeMainWindow(QMainWindow):
         self._legend_action_group.setExclusive(True)
         for legend_source in legends:
             action = self._legend_menu.addAction(self._legend_name(legend_source))
-            action.setIconSize(QSize(320, 48))
             action.setIcon(self._legend_icon(legend_source))
             action.setCheckable(True)
             action.setChecked(legend_source == current_legend)
@@ -310,10 +692,18 @@ class GlobeMainWindow(QMainWindow):
         legend_value = str(legend_source)
         if legend_value not in self._available_legend_sources():
             raise FileNotFoundError(f"Legend not found: {legend_value}")
+        if legend_value == self._current_legend:
+            return
 
         self._current_legend = legend_value
         self._settings.setValue("legend/current", legend_value)
         self.viewer.set_colormap(load_topo_cmap(legend_value, name=self._legend_name(legend_value)))
+        self._mark_project_metadata_dirty()
+
+    def new_project(self) -> None:
+        if not self._confirm_discard_or_save_changes("starting a new project"):
+            return
+        self._set_heightfield(None)
 
     def _start_heightfield_load(self, heightfield: Path, elevation: np.ndarray) -> None:
         if self._load_thread is not None:
@@ -401,6 +791,152 @@ class GlobeMainWindow(QMainWindow):
         self._pending_heightfield = None
         self._pending_elevation = None
 
+    def _start_tiff_import(self, path: Path) -> None:
+        if self._import_thread is not None:
+            raise RuntimeError("A TIFF import is already in progress.")
+        if self._load_thread is not None:
+            raise RuntimeError("Wait for the current heightfield load to finish before importing.")
+        if self._export_thread is not None:
+            raise RuntimeError("Wait for the current TIFF export to finish before importing.")
+
+        self._pending_import_path = Path(path)
+        self._import_progress_dialog = TiffImportProgressDialog(self)
+        self._import_thread = QThread(self)
+        self._import_worker = TiffImportWorker(
+            self._pending_import_path,
+            min_level=self._mesh_min_level,
+            max_level=self._mesh_max_level,
+            threshold=self._mesh_threshold,
+        )
+        self._import_worker.moveToThread(self._import_thread)
+
+        self._import_thread.started.connect(self._import_worker.run)
+        self._import_worker.progressMessageChanged.connect(self._import_progress_dialog.set_status)
+        self._import_worker.progressChanged.connect(self._import_progress_dialog.update_progress)
+        self._import_worker.completed.connect(self._on_tiff_import_completed)
+        self._import_worker.failed.connect(self._on_tiff_import_failed)
+        self._import_worker.cancelled.connect(self._on_tiff_import_cancelled)
+        self._import_worker.completed.connect(self._import_thread.quit)
+        self._import_worker.failed.connect(self._import_thread.quit)
+        self._import_worker.cancelled.connect(self._import_thread.quit)
+        self._import_thread.finished.connect(self._cleanup_tiff_import)
+        self._import_progress_dialog.cancelRequested.connect(self._import_worker.cancel)
+        self._import_progress_dialog.cancelRequested.connect(self._import_progress_dialog.show_cancelling)
+
+        self._import_progress_dialog.show()
+        self._import_thread.start()
+
+    @Slot(object)
+    def _on_tiff_import_completed(self, payload: object) -> None:
+        if self._pending_import_path is None:
+            raise RuntimeError("TIFF import completed without a pending import path.")
+        if (
+            not isinstance(payload, tuple)
+            or len(payload) != 2
+        ):
+            raise RuntimeError(f"TIFF import completed with unexpected payload: {payload!r}")
+
+        raster, grid = payload
+        raster_data = np.asarray(raster, dtype=np.float32)
+        if not isinstance(grid, IcosphereGrid):
+            raise RuntimeError(f"TIFF import completed with unexpected grid payload: {grid!r}")
+        self._set_heightfield(self._pending_import_path, elevation=raster_data, mesh_grid=grid)
+        self._close_import_progress_dialog()
+
+    @Slot(object)
+    def _on_tiff_import_failed(self, exc: object) -> None:
+        self._close_import_progress_dialog()
+        if not isinstance(exc, Exception):
+            raise RuntimeError(f"TIFF import failed with unexpected error payload: {exc!r}")
+        QMessageBox.critical(self, "Failed to import TIFF", str(exc))
+
+    @Slot()
+    def _on_tiff_import_cancelled(self) -> None:
+        self._close_import_progress_dialog()
+
+    def _close_import_progress_dialog(self) -> None:
+        if self._import_progress_dialog is None:
+            return
+        self._import_progress_dialog.close()
+        self._import_progress_dialog.deleteLater()
+        self._import_progress_dialog = None
+
+    @Slot()
+    def _cleanup_tiff_import(self) -> None:
+        if self._import_worker is not None:
+            self._import_worker.deleteLater()
+            self._import_worker = None
+        if self._import_thread is not None:
+            self._import_thread.deleteLater()
+            self._import_thread = None
+        self._pending_import_path = None
+
+    def _start_tiff_export(self, path: Path) -> None:
+        if self._export_thread is not None:
+            raise RuntimeError("A TIFF export is already in progress.")
+        if self._import_thread is not None:
+            raise RuntimeError("Wait for the current TIFF import to finish before exporting.")
+        if self._load_thread is not None:
+            raise RuntimeError("Wait for the current heightfield load to finish before exporting.")
+
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("TIFF export requires an icosphere grid.")
+
+        self._pending_export_path = Path(path)
+        self._export_progress_dialog = TiffExportProgressDialog(self)
+        self._export_thread = QThread(self)
+        self._export_worker = TiffExportWorker(mesh_grid, self._pending_export_path)
+        self._export_worker.moveToThread(self._export_thread)
+
+        self._export_thread.started.connect(self._export_worker.run)
+        self._export_worker.progressMessageChanged.connect(self._export_progress_dialog.set_status)
+        self._export_worker.progressChanged.connect(self._export_progress_dialog.update_progress)
+        self._export_worker.completed.connect(self._on_tiff_export_completed)
+        self._export_worker.failed.connect(self._on_tiff_export_failed)
+        self._export_worker.cancelled.connect(self._on_tiff_export_cancelled)
+        self._export_worker.completed.connect(self._export_thread.quit)
+        self._export_worker.failed.connect(self._export_thread.quit)
+        self._export_worker.cancelled.connect(self._export_thread.quit)
+        self._export_thread.finished.connect(self._cleanup_tiff_export)
+        self._export_progress_dialog.cancelRequested.connect(self._export_worker.cancel)
+        self._export_progress_dialog.cancelRequested.connect(self._export_progress_dialog.show_cancelling)
+
+        self._export_progress_dialog.show()
+        self._export_thread.start()
+
+    @Slot()
+    def _on_tiff_export_completed(self) -> None:
+        self._close_export_progress_dialog()
+
+    @Slot(object)
+    def _on_tiff_export_failed(self, exc: object) -> None:
+        self._close_export_progress_dialog()
+        if not isinstance(exc, Exception):
+            raise RuntimeError(f"TIFF export failed with unexpected error payload: {exc!r}")
+        QMessageBox.critical(self, "Failed to export TIFF", str(exc))
+
+    @Slot()
+    def _on_tiff_export_cancelled(self) -> None:
+        self._close_export_progress_dialog()
+
+    def _close_export_progress_dialog(self) -> None:
+        if self._export_progress_dialog is None:
+            return
+        self._export_progress_dialog.close()
+        self._export_progress_dialog.deleteLater()
+        self._export_progress_dialog = None
+
+    @Slot()
+    def _cleanup_tiff_export(self) -> None:
+        if self._export_worker is not None:
+            self._export_worker.deleteLater()
+            self._export_worker = None
+        if self._export_thread is not None:
+            self._export_thread.deleteLater()
+            self._export_thread = None
+        self._pending_export_path = None
+
     def _set_heightfield(
         self,
         heightfield: Optional[Path],
@@ -408,6 +944,7 @@ class GlobeMainWindow(QMainWindow):
         elevation: Optional[np.ndarray] = None,
         mesh_grid: Optional[IcosphereGrid] = None,
     ) -> None:
+        self._undo_stack.clear()
         existing_settings = None
         if isinstance(self.centralWidget(), GlobeViewer):
             existing_settings = self._current_grid_settings()
@@ -436,18 +973,26 @@ class GlobeMainWindow(QMainWindow):
             if old_viewer is not None:
                 old_viewer.deleteLater()
 
-            self.setWindowTitle(view_title)
+            self._set_project_window_title(view_title)
             self._heightfield = None
             self._save_path = None
             self._export_path = None
             self._sync_tool_mode_to_viewer()
+            self._mark_project_clean()
             return
 
         heightfield = Path(heightfield).expanduser().resolve()
         if not heightfield.is_file():
             raise FileNotFoundError(f"Heightfield not found: {heightfield}")
 
-        if elevation is not None:
+        if Project.is_project_path(heightfield):
+            project = Project.load(heightfield)
+            legend_source = project.metadata.get("legend_source")
+            if isinstance(legend_source, str) and legend_source in self._available_legend_sources():
+                self._current_legend = legend_source
+            elevation_data = project.raster
+            mesh_grid = project.grid
+        elif elevation is not None:
             elevation_data = np.asarray(elevation, dtype=np.float32)
         elif heightfield.suffix.lower() in (".npy", ".npz"):
             elevation_data = self._load_numpy_heightfield(heightfield)
@@ -474,11 +1019,12 @@ class GlobeMainWindow(QMainWindow):
         if old_viewer is not None:
             old_viewer.deleteLater()
 
-        self.setWindowTitle(heightfield.stem)
+        self._set_project_window_title(heightfield.stem)
         self._heightfield = heightfield
-        self._save_path = None
+        self._save_path = heightfield if Project.is_project_path(heightfield) else None
         self._export_path = None
         self._sync_tool_mode_to_viewer()
+        self._mark_project_clean()
 
     def _current_grid_settings(self) -> Dict[str, Dict[str, Union[bool, float, QColor]]]:
         viewer = self.viewer
@@ -559,8 +1105,21 @@ class GlobeMainWindow(QMainWindow):
         self._save_grid_settings()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if not self._confirm_discard_or_save_changes("closing the application"):
+            event.ignore()
+            return
         for tool in self._tools.values():
             tool.dispose_options_dialog()
+        if self._import_worker is not None:
+            self._import_worker.cancel()
+        if self._import_thread is not None:
+            self._import_thread.quit()
+            self._import_thread.wait()
+        if self._export_worker is not None:
+            self._export_worker.cancel()
+        if self._export_thread is not None:
+            self._export_thread.quit()
+            self._export_thread.wait()
         if self._load_worker is not None:
             self._load_worker.cancel()
         if self._load_thread is not None:
@@ -575,7 +1134,11 @@ class GlobeMainWindow(QMainWindow):
         dialog = QFileDialog(self, "Open Heightfield", str(starting_dir))
         dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dialog.setNameFilter("NumPy Arrays (*.npy *.npz);;All Files (*)")
+        dialog.setNameFilter(
+            f"Oswald Globe Projects (*{Project.FILE_SUFFIX});;"
+            "NumPy Arrays (*.npy *.npz);;"
+            "All Files (*)"
+        )
         return dialog
 
     @staticmethod
@@ -598,6 +1161,12 @@ class GlobeMainWindow(QMainWindow):
             return
 
         heightfield = Path(selected_files[0])
+        if Project.is_project_path(heightfield):
+            try:
+                self._set_heightfield(heightfield)
+            except Exception as exc:
+                QMessageBox.critical(self, "Failed to open project", str(exc))
+            return
         progress_dialog = IcosphereProgressDialog(self)
         self._progress_dialog = progress_dialog
         progress_dialog.start_stage("loading-heightfield")
@@ -634,46 +1203,75 @@ class GlobeMainWindow(QMainWindow):
         if heightfield.suffix.lower() not in (".tif", ".tiff"):
             QMessageBox.critical(self, "Failed to import TIFF", "Select a .tif or .tiff file.")
             return
-
-        progress_dialog = IcosphereProgressDialog(self)
-        self._progress_dialog = progress_dialog
-        progress_dialog.start_stage("loading-heightfield")
-        progress_dialog.show()
         try:
-            elevation = load_elevation(heightfield)
+            self._start_tiff_import(heightfield)
         except Exception as exc:
-            progress_dialog.close()
-            progress_dialog.deleteLater()
-            self._progress_dialog = None
             QMessageBox.critical(self, "Failed to import TIFF", str(exc))
-            return
-        progress_dialog.finish_stage("loading-heightfield")
-        self._start_heightfield_load(heightfield, elevation)
 
-    def save_heightfield(self) -> None:
+    def save_heightfield(self) -> bool:
         if self._save_path is None:
-            self.save_heightfield_as()
-            return
-        self._save_heightfield(self._save_path)
+            return self.save_heightfield_as()
+        try:
+            self._save_heightfield(self._save_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Failed to save project", str(exc))
+            return False
+        self._save_path = self._save_path
+        self._mark_project_clean()
+        return True
 
-    def save_heightfield_as(self) -> None:
-        default_path = (self._heightfield.with_suffix(".npy") if self._heightfield is not None else Path("sea_level.npy"))
+    def save_heightfield_as(self) -> bool:
+        default_path = (
+            self._heightfield.with_suffix(Project.FILE_SUFFIX)
+            if self._heightfield is not None
+            else Path(f"sea_level{Project.FILE_SUFFIX}")
+        )
         file_name, _ = QFileDialog.getSaveFileName(
             self,
-            "Save Heightfield",
+            "Save Project",
             str(default_path),
-            "NumPy Array (*.npy);;Compressed NumPy Array (*.npz)",
+            (
+                f"Oswald Globe Project (*{Project.FILE_SUFFIX});;"
+                "NumPy Array (*.npy);;"
+                "Compressed NumPy Array (*.npz)"
+            ),
         )
-        if file_name:
-            self._save_path = Path(file_name)
-            self._save_heightfield(self._save_path)
+        if not file_name:
+            return False
+        save_path = Path(file_name)
+        if not save_path.suffix:
+            save_path = save_path.with_suffix(Project.FILE_SUFFIX)
+        elif save_path.suffix.lower() not in (Project.FILE_SUFFIX, ".npy", ".npz"):
+            QMessageBox.critical(
+                self,
+                "Failed to save project",
+                f"Unsupported save format: {save_path.suffix}",
+            )
+            return False
+        try:
+            self._save_heightfield(save_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Failed to save project", str(exc))
+            return False
+        self._save_path = save_path
+        self._mark_project_clean()
+        return True
 
     def _save_heightfield(self, path: Path) -> None:
         path = Path(path)
         gl_widget = self.viewer.gl_widget
         data = gl_widget.current_raster_data() if gl_widget.mesh_grid is not None else self.viewer.data
         suffix = path.suffix.lower()
-        if suffix == ".npy":
+        if suffix == Project.FILE_SUFFIX:
+            mesh_grid = gl_widget.mesh_grid
+            if mesh_grid is None:
+                raise RuntimeError("Project saves require an icosphere grid.")
+            Project(
+                raster=data,
+                grid=mesh_grid,
+                metadata={"legend_source": self._current_legend},
+            ).save(path)
+        elif suffix == ".npy":
             np.save(path, data)
         elif suffix == ".npz":
             np.savez_compressed(path, elevation=data)
@@ -684,7 +1282,10 @@ class GlobeMainWindow(QMainWindow):
         if self._export_path is None:
             self.export_tiff_as()
             return
-        self._export_tiff(self._export_path)
+        try:
+            self._start_tiff_export(self._export_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Failed to export TIFF", str(exc))
 
     def export_tiff_as(self) -> None:
         default_path = (
@@ -706,15 +1307,17 @@ class GlobeMainWindow(QMainWindow):
                     return
                 export_path = export_path.with_suffix(".tif")
             self._export_path = export_path
-            self._export_tiff(self._export_path)
+            try:
+                self._start_tiff_export(self._export_path)
+            except Exception as exc:
+                QMessageBox.critical(self, "Failed to export TIFF", str(exc))
 
     def _export_tiff(self, path: Path) -> None:
         mesh_grid = self.viewer.gl_widget.mesh_grid
         if mesh_grid is None:
             raise RuntimeError("TIFF export requires an icosphere grid.")
-        height, width = self.viewer.gl_widget.raw_data.shape
-        raster = mesh_grid.to_equirectangular(height, width)
-        Image.fromarray(np.asarray(raster, dtype=np.float32)).save(path, format="TIFF")
+        raster = mesh_grid.to_equirectangular(height=2048, width=4096)
+        _write_tiff_export(Path(path), raster)
 
 
 def create_window(

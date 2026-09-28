@@ -17,6 +17,7 @@ class UndoStack:
     def __init__(self, on_changed: Optional[Callable[[], None]] = None):
         self._commands: List[UndoableCommand] = []
         self._index = 0
+        self._clean_index: Optional[int] = 0
         self._on_changed = on_changed
 
     def can_undo(self) -> bool:
@@ -26,6 +27,8 @@ class UndoStack:
         return self._index < len(self._commands)
 
     def push(self, command: UndoableCommand) -> None:
+        if self._clean_index is not None and self._clean_index > self._index:
+            self._clean_index = None
         del self._commands[self._index :]
         self._commands.append(command)
         self._index = len(self._commands)
@@ -46,6 +49,19 @@ class UndoStack:
         self._index += 1
         command.redo()
         self._notify_changed()
+
+    def clear(self) -> None:
+        self._commands.clear()
+        self._index = 0
+        self._clean_index = 0
+        self._notify_changed()
+
+    def set_clean(self) -> None:
+        self._clean_index = self._index
+        self._notify_changed()
+
+    def is_clean(self) -> bool:
+        return self._clean_index is not None and self._index == self._clean_index
 
     def _notify_changed(self) -> None:
         if self._on_changed is not None:

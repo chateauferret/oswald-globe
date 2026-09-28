@@ -5,13 +5,24 @@ import sys
 import numpy as np
 from PIL import Image
 import pytest
-from PySide6.QtCore import QSettings, Qt, QPointF
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QComboBox, QFileDialog, QSlider, QSpinBox, QToolTip
+from PySide6.QtCore import QDir, QSettings, Qt, QPointF
+from PySide6.QtGui import QColor, QCloseEvent
+from PySide6.QtWidgets import QComboBox, QFileDialog, QMessageBox, QProgressBar, QSlider, QSpinBox, QToolTip
 
 from oswald_globe.app import IcosphereProgressDialog, create_window, load_elevation
+from oswald_globe.globe_main_window import (
+    TiffExportProgressDialog,
+    TiffImportProgressDialog,
+    TiffImportWorker,
+    _load_tiff_import_raster,
+)
 from oswald_globe.icosphere_grid import IcosphereGrid
+from oswald_globe.project import Project
 from oswald_globe.undo_stack import BrushPaintCommand, UndoStack
+
+
+def _project_window_title(window) -> str:
+    return window.windowTitle().replace("[*]", "")
 
 
 def test_load_elevation(tmp_path: Path):
@@ -30,7 +41,8 @@ def test_create_window_defaults_to_empty_sea_level_globe(qapp):
     window = create_window()
     try:
         assert window._heightfield is None
-        assert window.windowTitle() == "Sea level"
+        assert window.windowTitle().endswith("[*]")
+        assert _project_window_title(window) == "Sea level"
         assert window.viewer.data.shape == (2, 2)
         np.testing.assert_allclose(window.viewer.data, 0.0)
         assert window.viewer.mesh_grid is not None
@@ -77,11 +89,13 @@ def test_create_window(qapp, tmp_path: Path):
         settings=settings,
     )
     assert window is not None
-    assert window.windowTitle() == "globe"
+    assert window.windowTitle().endswith("[*]")
+    assert _project_window_title(window) == "globe"
     assert window.centralWidget() is not None
     assert [action.text() for action in window.menuBar().actions()] == ["File", "Edit", "Tools", "View"]
     assert window._file_menu is not None
     assert [action.text() for action in window._file_menu.actions() if action.text()] == [
+        "New",
         "Open",
         "Save",
         "Save As...",
@@ -102,8 +116,7 @@ def test_create_window(qapp, tmp_path: Path):
     legend_menu = window._legend_menu
     window._populate_legend_menu()
     assert [action.text() for action in legend_menu.actions()] == ["grayscale", "topography"]
-    assert all(action.icon().isNull() for action in legend_menu.actions())
-    assert all(action.defaultWidget() is not None for action in legend_menu.actions())
+    assert all(not action.icon().isNull() for action in legend_menu.actions())
     assert [action.text() for action in legend_menu.actions() if action.isChecked()] == ["topography"]
 
     window.set_legend(":/legends/grayscale.txt")
@@ -127,6 +140,7 @@ def test_create_window(qapp, tmp_path: Path):
     assert viewer.gl_widget.graticule_color == (0.0, 1.0, 0.0)
     assert viewer.gl_widget.graticule_opacity == 0.75
 
+    window._mark_project_clean()
     window.close()
 
     restored_window = create_window(
@@ -149,6 +163,218 @@ def test_create_window(qapp, tmp_path: Path):
     assert restored_viewer.gl_widget.graticule_color == (0.0, 1.0, 0.0)
     assert restored_viewer.gl_widget.graticule_opacity == 0.75
     restored_window.close()
+
+
+def test_new_project_resets_to_sea_level_when_clean(
+    qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source_path = tmp_path / "source.tif"
+    Image.fromarray(np.ones((32, 64), dtype=np.float32)).save(source_path)
+    window = create_window(heightfield=source_path, mesh_min_level=1, mesh_max_level=2)
+    try:
+        original_viewer = window.viewer
+        monkeypatch.setattr(
+            QMessageBox,
+            "warning",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("warning should not be shown")),
+        )
+
+        window.new_project()
+
+        assert window.viewer is not original_viewer
+        assert _project_window_title(window) == "Sea level"
+        assert window._heightfield is None
+        assert window._save_path is None
+        np.testing.assert_allclose(window.viewer.data, 0.0)
+        assert window._undo_stack.is_clean() is True
+        assert window.isWindowModified() is False
+    finally:
+        window.close()
+
+
+def test_new_project_cancel_keeps_existing_state(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        class DummyCommand:
+            def redo(self) -> None:
+                pass
+
+            def undo(self) -> None:
+                pass
+
+        window._undo_stack.push(DummyCommand())
+        original_viewer = window.viewer
+        monkeypatch.setattr(
+            QMessageBox,
+            "warning",
+            lambda *args, **kwargs: QMessageBox.StandardButton.Cancel,
+        )
+
+        window.new_project()
+
+        assert window.viewer is original_viewer
+        assert window._undo_stack.is_clean() is False
+        assert window.isWindowModified() is True
+    finally:
+        window.close()
+
+
+def test_new_project_save_then_resets(qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        class DummyCommand:
+            def redo(self) -> None:
+                pass
+
+            def undo(self) -> None:
+                pass
+
+        save_path = tmp_path / "saved_project.ogp"
+        saved = []
+        window._undo_stack.push(DummyCommand())
+        monkeypatch.setattr(
+            QMessageBox,
+            "warning",
+            lambda *args, **kwargs: QMessageBox.StandardButton.Save,
+        )
+        monkeypatch.setattr(
+            window,
+            "save_heightfield",
+            lambda: saved.append(True) or setattr(window, "_save_path", save_path) or True,
+        )
+
+        window.new_project()
+
+        assert saved == [True]
+        assert _project_window_title(window) == "Sea level"
+        assert window._heightfield is None
+        assert window._save_path is None
+        assert window._undo_stack.is_clean() is True
+        assert window.isWindowModified() is False
+    finally:
+        window.close()
+
+
+def test_new_project_discard_then_resets_without_saving(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        class DummyCommand:
+            def redo(self) -> None:
+                pass
+
+            def undo(self) -> None:
+                pass
+
+        saved = []
+        original_viewer = window.viewer
+        window._undo_stack.push(DummyCommand())
+        monkeypatch.setattr(
+            QMessageBox,
+            "warning",
+            lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+        )
+        monkeypatch.setattr(window, "save_heightfield", lambda: saved.append(True) or True)
+
+        window.new_project()
+
+        assert saved == []
+        assert window.viewer is not original_viewer
+        assert _project_window_title(window) == "Sea level"
+        assert window._undo_stack.is_clean() is True
+        assert window.isWindowModified() is False
+    finally:
+        window.close()
+
+
+def test_close_event_cancel_keeps_window_open(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        class DummyCommand:
+            def redo(self) -> None:
+                pass
+
+            def undo(self) -> None:
+                pass
+
+        window._undo_stack.push(DummyCommand())
+        monkeypatch.setattr(
+            QMessageBox,
+            "warning",
+            lambda *args, **kwargs: QMessageBox.StandardButton.Cancel,
+        )
+
+        event = QCloseEvent()
+        window.closeEvent(event)
+
+        assert event.isAccepted() is False
+        assert window.isWindowModified() is True
+    finally:
+        window._mark_project_clean()
+        window.close()
+
+
+def test_close_event_save_then_accepts(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        class DummyCommand:
+            def redo(self) -> None:
+                pass
+
+            def undo(self) -> None:
+                pass
+
+        window._undo_stack.push(DummyCommand())
+        monkeypatch.setattr(
+            QMessageBox,
+            "warning",
+            lambda *args, **kwargs: QMessageBox.StandardButton.Save,
+        )
+        monkeypatch.setattr(window, "save_heightfield", lambda: True)
+        sync_calls = []
+        monkeypatch.setattr(window, "_save_grid_settings", lambda: sync_calls.append("grid"))
+        monkeypatch.setattr(window._settings, "sync", lambda: sync_calls.append("sync"))
+
+        event = QCloseEvent()
+        window.closeEvent(event)
+
+        assert event.isAccepted() is True
+        assert sync_calls == ["grid", "sync"]
+    finally:
+        window._mark_project_clean()
+        window.close()
+
+
+def test_close_event_discard_then_accepts_without_saving(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        class DummyCommand:
+            def redo(self) -> None:
+                pass
+
+            def undo(self) -> None:
+                pass
+
+        saved = []
+        window._undo_stack.push(DummyCommand())
+        monkeypatch.setattr(
+            QMessageBox,
+            "warning",
+            lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+        )
+        monkeypatch.setattr(window, "save_heightfield", lambda: saved.append(True) or True)
+        sync_calls = []
+        monkeypatch.setattr(window, "_save_grid_settings", lambda: sync_calls.append("grid"))
+        monkeypatch.setattr(window._settings, "sync", lambda: sync_calls.append("sync"))
+
+        event = QCloseEvent()
+        window.closeEvent(event)
+
+        assert saved == []
+        assert event.isAccepted() is True
+        assert sync_calls == ["grid", "sync"]
+    finally:
+        window._mark_project_clean()
+        window.close()
 
 
 def test_paint_tool_selection_shows_options_and_navigate_disposes(qapp):
@@ -525,9 +751,11 @@ def test_open_heightfield_dialog_configuration(qapp):
 
     assert dialog.acceptMode() == dialog.AcceptMode.AcceptOpen
     assert dialog.fileMode() == dialog.FileMode.ExistingFile
-    assert dialog.nameFilters()[0].startswith("NumPy Arrays (")
-    assert "*.npy" in dialog.nameFilters()[0]
-    assert "*.npz" in dialog.nameFilters()[0]
+    assert dialog.nameFilters()[0].startswith("Oswald Globe Projects (")
+    assert "*.ogp" in dialog.nameFilters()[0]
+    assert dialog.nameFilters()[1].startswith("NumPy Arrays (")
+    assert "*.npy" in dialog.nameFilters()[1]
+    assert "*.npz" in dialog.nameFilters()[1]
 
     window.close()
 
@@ -574,6 +802,34 @@ def test_icosphere_progress_dialog_lists_all_stages(qapp):
     dialog.deleteLater()
 
 
+def test_available_legend_sources_merges_resources_and_filesystem(
+    qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from oswald_globe.globe_main_window import GlobeMainWindow
+
+    legends_dir = tmp_path / "legends"
+    legends_dir.mkdir()
+    (legends_dir / "topography.txt").write_text(
+        "{'red': ((0.0, 0.0, 0.0),), 'green': ((0.0, 0.0, 0.0),), 'blue': ((0.0, 0.0, 0.0),)}",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("oswald_globe.globe_main_window.LEGENDS_DIR", legends_dir)
+    monkeypatch.setattr(
+        QDir,
+        "entryList",
+        lambda self, _patterns, _filters, _sort: ["grayscale.txt"],
+    )
+
+    window = create_window()
+    try:
+        sources = window._available_legend_sources()
+        assert ":/legends/grayscale.txt" in sources
+        assert str(legends_dir / "topography.txt") in sources
+        assert sorted(window._legend_name(source) for source in sources) == ["grayscale", "topography"]
+    finally:
+        window.close()
+
+
 def test_open_heightfield_cancel_is_noop(qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     original_path = tmp_path / "original.tif"
     Image.fromarray(np.zeros((32, 64), dtype=np.float32)).save(original_path)
@@ -590,7 +846,7 @@ def test_open_heightfield_cancel_is_noop(qapp, tmp_path: Path, monkeypatch: pyte
 
     assert window._heightfield == original_path.resolve()
     assert window.viewer is original_viewer
-    assert window.windowTitle() == "original"
+    assert _project_window_title(window) == "original"
 
     window.close()
 
@@ -626,7 +882,7 @@ def test_open_heightfield_loads_selected_numpy_array(qapp, tmp_path: Path, monke
     window.open_heightfield()
 
     assert window._heightfield == replacement_path.resolve()
-    assert window.windowTitle() == "replacement"
+    assert _project_window_title(window) == "replacement"
     assert window.viewer is not original_viewer
     assert window.viewer.mesh_grid is not None
     assert window.viewer.mesh_grid is not original_mesh
@@ -636,12 +892,152 @@ def test_open_heightfield_loads_selected_numpy_array(qapp, tmp_path: Path, monke
     window.close()
 
 
-def test_import_tiff_builds_icosphere_from_equirectangular_raster(
+def test_project_round_trip_preserves_mesh_geometry_layers_and_metadata(tmp_path: Path):
+    raster = np.arange(32, dtype=np.float32).reshape(4, 8)
+    grid = IcosphereGrid.from_equirectangular(raster, min_level=1, max_level=2, threshold=5.0)
+    grid.add_layer(
+        "temperature",
+        np.linspace(-10.0, 25.0, grid.vertex_count(), dtype=np.float64),
+        description="Surface temperature",
+        visible=False,
+        opacity=42.0,
+        legend="grayscale",
+        z_index=3,
+    )
+    metadata = {"legend_source": ":/legends/grayscale.txt", "author": "tests"}
+    project_path = tmp_path / "round_trip.ogp"
+
+    Project(raster=raster, grid=grid, metadata=metadata).save(project_path)
+    loaded = Project.load(project_path)
+
+    np.testing.assert_allclose(loaded.raster, raster)
+    assert loaded.metadata == metadata
+    np.testing.assert_allclose(loaded.grid.vertices, grid.vertices)
+    np.testing.assert_array_equal(loaded.grid.layer_names(), grid.layer_names())
+    np.testing.assert_allclose(
+        loaded.grid.get_layer("elevation").values,
+        grid.get_layer("elevation").values,
+    )
+    loaded_temperature = loaded.grid.get_layer("temperature")
+    original_temperature = grid.get_layer("temperature")
+    np.testing.assert_allclose(loaded_temperature.values, original_temperature.values)
+    assert loaded_temperature.description == "Surface temperature"
+    assert loaded_temperature.visible is False
+    assert loaded_temperature.opacity == pytest.approx(42.0)
+    assert loaded_temperature.legend is not None
+    assert loaded_temperature.legend.name == "grayscale"
+    assert loaded_temperature.z_index == 3
+
+
+def test_create_window_loads_project_file_without_rebuilding_mesh(qapp, tmp_path: Path):
+    raster = np.arange(32, dtype=np.float32).reshape(4, 8)
+    grid = IcosphereGrid.from_equirectangular(raster, min_level=1, max_level=2, threshold=5.0)
+    grid.get_layer("elevation").values[:] = np.linspace(
+        -50.0, 75.0, grid.vertex_count(), dtype=np.float64
+    )
+    project_path = tmp_path / "saved_project.ogp"
+    Project(
+        raster=raster,
+        grid=grid,
+        metadata={"legend_source": ":/legends/grayscale.txt"},
+    ).save(project_path)
+
+    window = create_window(heightfield=project_path, mesh_min_level=1, mesh_max_level=5, mesh_threshold=999.0)
+    try:
+        assert window._heightfield == project_path.resolve()
+        assert window._save_path == project_path.resolve()
+        assert _project_window_title(window) == "saved_project"
+        assert window.viewer.cmap.name == "grayscale"
+        assert window.viewer.mesh_grid is not None
+        np.testing.assert_allclose(window.viewer.data, raster)
+        np.testing.assert_allclose(window.viewer.mesh_grid.vertices, grid.vertices)
+        np.testing.assert_allclose(
+            window.viewer.mesh_grid.get_layer("elevation").values,
+            grid.get_layer("elevation").values,
+        )
+    finally:
+        window.close()
+
+
+def test_open_heightfield_loads_selected_project_file(qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source_path = tmp_path / "source.tif"
+    Image.fromarray(np.zeros((32, 64), dtype=np.float32)).save(source_path)
+    raster = np.arange(32, dtype=np.float32).reshape(4, 8)
+    project_grid = IcosphereGrid.from_equirectangular(raster, min_level=1, max_level=2, threshold=5.0)
+    project_path = tmp_path / "saved_project.ogp"
+    Project(raster=raster, grid=project_grid, metadata={}).save(project_path)
+
+    window = create_window(heightfield=source_path, mesh_min_level=1, mesh_max_level=4, mesh_threshold=999.0)
+    try:
+        original_viewer = window.viewer
+
+        class AcceptDialog:
+            def exec(self):
+                return QFileDialog.DialogCode.Accepted
+
+            def selectedFiles(self):
+                return [str(project_path)]
+
+        started = []
+        monkeypatch.setattr(window, "_create_open_heightfield_dialog", lambda: AcceptDialog())
+        monkeypatch.setattr(window, "_start_heightfield_load", lambda *args: started.append(args))
+
+        window.open_heightfield()
+
+        assert started == []
+        assert window.viewer is not original_viewer
+        assert window._heightfield == project_path.resolve()
+        assert window._save_path == project_path.resolve()
+        np.testing.assert_allclose(window.viewer.data, raster)
+        assert window.viewer.mesh_grid is not None
+        np.testing.assert_allclose(window.viewer.mesh_grid.vertices, project_grid.vertices)
+        np.testing.assert_allclose(
+            window.viewer.mesh_grid.get_layer("elevation").values,
+            project_grid.get_layer("elevation").values,
+        )
+    finally:
+        window.close()
+
+
+def test_save_heightfield_writes_project_file_with_current_mesh_state(qapp, tmp_path: Path):
+    window = create_window(mesh_min_level=1, mesh_max_level=2)
+    try:
+        widget = window.viewer.gl_widget
+        assert widget.mesh_grid is not None
+        widget.mesh_grid.get_layer("elevation").values[:] = np.linspace(
+            10.0, 20.0, widget.mesh_grid.vertex_count(), dtype=np.float64
+        )
+        widget.mesh_grid.add_layer(
+            "humidity",
+            np.linspace(0.0, 1.0, widget.mesh_grid.vertex_count(), dtype=np.float64),
+            description="Relative humidity",
+        )
+        window.set_legend(":/legends/grayscale.txt")
+
+        project_path = tmp_path / "saved_project.ogp"
+        window._save_heightfield(project_path)
+
+        loaded = Project.load(project_path)
+        np.testing.assert_allclose(loaded.raster, window.viewer.data)
+        assert loaded.metadata["legend_source"] == ":/legends/grayscale.txt"
+        np.testing.assert_allclose(
+            loaded.grid.get_layer("elevation").values,
+            widget.mesh_grid.get_layer("elevation").values,
+        )
+        np.testing.assert_allclose(
+            loaded.grid.get_layer("humidity").values,
+            widget.mesh_grid.get_layer("humidity").values,
+        )
+    finally:
+        window._mark_project_clean()
+        window.close()
+
+
+def test_import_tiff_dispatches_to_background_worker(
     qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     tiff_path = tmp_path / "world.tif"
-    Image.fromarray(np.zeros((32, 64), dtype=np.float32)).save(tiff_path)
-    elevation = np.arange(32 * 64, dtype=np.float32).reshape(32, 64)
+    Image.fromarray(np.zeros((32, 64), dtype=np.uint8)).save(tiff_path)
     window = create_window(mesh_min_level=1, mesh_max_level=2)
 
     class AcceptDialog:
@@ -651,20 +1047,127 @@ def test_import_tiff_builds_icosphere_from_equirectangular_raster(
         def selectedFiles(self):
             return [str(tiff_path)]
 
-    load_args = []
     monkeypatch.setattr(window, "_create_import_tiff_dialog", lambda: AcceptDialog())
-    monkeypatch.setattr("oswald_globe.globe_main_window.load_elevation", lambda path: elevation)
-    monkeypatch.setattr(
-        window,
-        "_start_heightfield_load",
-        lambda path, data: load_args.append((path, data)),
-    )
+    started = []
+    monkeypatch.setattr(window, "_start_tiff_import", lambda path: started.append(Path(path)))
 
     window.import_tiff()
 
-    assert load_args[0][0] == tiff_path
-    np.testing.assert_array_equal(load_args[0][1], elevation)
+    assert started == [tiff_path]
     window.close()
+
+
+def test_load_tiff_import_raster_rescales_to_2_to_1_and_maps_luminance(tmp_path: Path):
+    tiff_path = tmp_path / "square.tif"
+    rgb = np.zeros((4, 4, 3), dtype=np.uint8)
+    rgb[:, :2] = 0
+    rgb[:, 2:] = 255
+    Image.fromarray(rgb, mode="RGB").save(tiff_path)
+
+    raster = _load_tiff_import_raster(tiff_path)
+
+    assert raster.shape == (4, 8)
+    assert float(raster.min()) == -32767.0
+    assert float(raster.max()) == 32767.0
+
+
+def test_load_tiff_import_raster_preserves_16bit_grayscale_levels(tmp_path: Path):
+    tiff_path = tmp_path / "grayscale16.tif"
+    grayscale = np.array(
+        [
+            [0, 16384, 32768, 65535],
+            [65535, 32768, 16384, 0],
+        ],
+        dtype=np.uint16,
+    )
+    Image.fromarray(grayscale).save(tiff_path)
+
+    raster = _load_tiff_import_raster(tiff_path)
+
+    expected = grayscale.astype(np.float32) / 65535.0 * 65534.0 - 32767.0
+    np.testing.assert_allclose(raster, expected, atol=1.0)
+    assert np.unique(raster).size > 2
+
+
+def test_import_tiff_completion_replaces_viewer_with_imported_adaptive_grid(qapp, tmp_path: Path):
+    tiff_path = tmp_path / "world.tif"
+    grayscale = np.tile(np.array([[0, 255]], dtype=np.uint8), (8, 1))
+    Image.fromarray(grayscale, mode="L").save(tiff_path)
+    window = create_window(mesh_min_level=1, mesh_max_level=1)
+    try:
+        raster = _load_tiff_import_raster(tiff_path)
+        original_grid = window.viewer.gl_widget.mesh_grid
+        imported_grid = IcosphereGrid.from_equirectangular(
+            raster,
+            min_level=window._mesh_min_level,
+            max_level=window._mesh_max_level,
+            threshold=window._mesh_threshold,
+        )
+        window._pending_import_path = tiff_path
+
+        window._on_tiff_import_completed((raster, imported_grid))
+
+        displayed_grid = window.viewer.gl_widget.mesh_grid
+        assert displayed_grid is not None
+        assert displayed_grid is imported_grid
+        assert displayed_grid is not original_grid
+        np.testing.assert_allclose(window.viewer.data, raster)
+        np.testing.assert_allclose(
+            displayed_grid.get_layer("elevation").values,
+            imported_grid.get_layer("elevation").values,
+        )
+    finally:
+        window.close()
+
+
+def test_tiff_import_worker_builds_adaptive_icosphere_from_raster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    tiff_path = tmp_path / "world.tif"
+    grayscale = np.arange(16, dtype=np.uint8).reshape(4, 4)
+    Image.fromarray(grayscale, mode="L").save(tiff_path)
+
+    observed = {}
+    built_grid = IcosphereGrid()
+
+    def fake_from_equirectangular(arr, *, min_level, max_level, threshold, progress_callback, is_cancelled):
+        observed["shape"] = arr.shape
+        observed["min_level"] = min_level
+        observed["max_level"] = max_level
+        observed["threshold"] = threshold
+        progress_callback("creating-faces", 1, 4)
+        progress_callback("balancing-faces", 1, 2)
+        progress_callback("populating-faces", 3, 6)
+        assert is_cancelled() is False
+        return built_grid
+
+    monkeypatch.setattr(IcosphereGrid, "from_equirectangular", staticmethod(fake_from_equirectangular))
+
+    worker = TiffImportWorker(tiff_path, min_level=2, max_level=5, threshold=123.0)
+    progress = []
+    messages = []
+    completed = []
+    worker.progressChanged.connect(lambda done, total: progress.append((done, total)))
+    worker.progressMessageChanged.connect(messages.append)
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    assert observed == {
+        "shape": (4, 8),
+        "min_level": 2,
+        "max_level": 5,
+        "threshold": 123.0,
+    }
+    assert messages[:2] == ["Loading TIFF file", "Mapping TIFF onto icosphere data"]
+    assert "Creating icosphere faces" in messages
+    assert "Balancing icosphere faces" in messages
+    assert "Populating globe data" in messages
+    assert completed
+    imported_raster, imported_grid = completed[0]
+    assert imported_grid is built_grid
+    assert imported_raster.shape == (4, 8)
+    assert progress[-1] == (100, 100)
 
 
 def test_export_tiff_rasterizes_icosphere_to_equirectangular_map(qapp, tmp_path: Path):
@@ -679,7 +1182,127 @@ def test_export_tiff_rasterizes_icosphere_to_equirectangular_map(qapp, tmp_path:
     window._export_tiff(output_path)
 
     with Image.open(output_path) as exported:
-        raster = np.asarray(exported, dtype=np.float32)
-    assert raster.shape == (32, 64)
-    np.testing.assert_allclose(raster, 123.5, atol=1e-4)
+        assert exported.mode.startswith("I;16")
+        raster = np.asarray(exported)
+    assert raster.shape == (2048, 4096)
+    assert raster.dtype == np.uint16
+    expected = int(round((123.5 + 32767.0) * (65535.0 / 65534.0)))
+    assert int(raster.min()) == expected
+    assert int(raster.max()) == expected
     window.close()
+
+
+def test_export_tiff_maps_signed_16bit_range_to_grayscale(qapp, tmp_path: Path):
+    source_path = tmp_path / "source.tif"
+    Image.fromarray(np.zeros((32, 64), dtype=np.float32)).save(source_path)
+    window = create_window(heightfield=source_path, mesh_min_level=1, mesh_max_level=2)
+    grid = window.viewer.gl_widget.mesh_grid
+    assert grid is not None
+
+    low_path = tmp_path / "export_low.tif"
+    high_path = tmp_path / "export_high.tif"
+
+    grid.get_layer("elevation").values[:] = -32767.0
+    window._export_tiff(low_path)
+    with Image.open(low_path) as exported_low:
+        raster_low = np.asarray(exported_low)
+    assert raster_low.dtype == np.uint16
+    assert int(raster_low.min()) == 0
+    assert int(raster_low.max()) == 0
+
+    grid.get_layer("elevation").values[:] = 32767.0
+    window._export_tiff(high_path)
+    with Image.open(high_path) as exported_high:
+        raster_high = np.asarray(exported_high)
+    assert raster_high.dtype == np.uint16
+    assert int(raster_high.min()) == 65535
+    assert int(raster_high.max()) == 65535
+    window.close()
+
+
+def test_export_tiff_is_readable_by_rasterio_with_expected_range(qapp, tmp_path: Path):
+    rasterio = pytest.importorskip("rasterio")
+
+    source_path = tmp_path / "source.tif"
+    Image.fromarray(np.zeros((32, 64), dtype=np.float32)).save(source_path)
+    window = create_window(heightfield=source_path, mesh_min_level=1, mesh_max_level=2)
+    grid = window.viewer.gl_widget.mesh_grid
+    assert grid is not None
+    grid.get_layer("elevation").values[:] = 123.5
+    output_path = tmp_path / "export.tif"
+
+    window._export_tiff(output_path)
+
+    with rasterio.open(output_path) as dataset:
+        raster = dataset.read(1)
+        assert dataset.width == 4096
+        assert dataset.height == 2048
+        assert dataset.count == 1
+        assert dataset.dtypes[0] == "uint16"
+        assert dataset.crs is not None
+    expected = int(round((123.5 + 32767.0) * (65535.0 / 65534.0)))
+    assert int(raster.min()) == expected
+    assert int(raster.max()) == expected
+    window.close()
+
+
+def test_export_tiff_starts_background_export(qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source_path = tmp_path / "source.tif"
+    Image.fromarray(np.zeros((32, 64), dtype=np.float32)).save(source_path)
+    window = create_window(heightfield=source_path, mesh_min_level=1, mesh_max_level=2)
+    try:
+        started = []
+        export_path = tmp_path / "export.tif"
+        window._export_path = export_path
+        monkeypatch.setattr(window, "_start_tiff_export", lambda path: started.append(Path(path)))
+
+        window.export_tiff()
+
+        assert started == [export_path]
+    finally:
+        window.close()
+
+
+def test_export_tiff_as_starts_background_export(qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source_path = tmp_path / "source.tif"
+    Image.fromarray(np.zeros((32, 64), dtype=np.float32)).save(source_path)
+    window = create_window(heightfield=source_path, mesh_min_level=1, mesh_max_level=2)
+    try:
+        started = []
+        monkeypatch.setattr(window, "_start_tiff_export", lambda path: started.append(Path(path)))
+        monkeypatch.setattr(
+            QFileDialog,
+            "getSaveFileName",
+            lambda *args, **kwargs: (str(tmp_path / "async_export"), "TIFF Image (*.tif *.tiff)"),
+        )
+
+        window.export_tiff_as()
+
+        assert started == [tmp_path / "async_export.tif"]
+        assert window._export_path == tmp_path / "async_export.tif"
+    finally:
+        window.close()
+
+
+def test_tiff_export_progress_dialog_updates_percentage(qapp):
+    dialog = TiffExportProgressDialog()
+    try:
+        dialog.update_progress(42, 100)
+        progress_bar = dialog.findChild(QProgressBar)
+        assert progress_bar is not None
+        assert progress_bar.value() == 42
+        assert progress_bar.maximum() == 100
+    finally:
+        dialog.close()
+
+
+def test_tiff_import_progress_dialog_updates_percentage(qapp):
+    dialog = TiffImportProgressDialog()
+    try:
+        dialog.update_progress(42, 100)
+        progress_bar = dialog.findChild(QProgressBar)
+        assert progress_bar is not None
+        assert progress_bar.value() == 42
+        assert progress_bar.maximum() == 100
+    finally:
+        dialog.close()

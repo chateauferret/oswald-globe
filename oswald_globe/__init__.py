@@ -4,7 +4,7 @@ from importlib import import_module
 
 __version__ = "0.1.0"
 
-__all__ = ["GlobeViewer", "globe_viewer", "IcosphereGrid", "load_topo_cmap"]
+__all__ = ["GlobeViewer", "globe_viewer", "IcosphereGrid", "Project", "load_topo_cmap"]
 
 
 def __getattr__(name: str):
@@ -15,4 +15,6 @@ def __getattr__(name: str):
         return getattr(module, name)
     if name == "IcosphereGrid":
         return import_module("oswald_globe.icosphere_grid").IcosphereGrid
+    if name == "Project":
+        return import_module("oswald_globe.project").Project
     raise AttributeError(f"module 'oswald_globe' has no attribute {name!r}")
