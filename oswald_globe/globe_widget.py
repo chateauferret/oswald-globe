@@ -114,7 +114,7 @@ from oswald_globe.utils import (
     sample_equirectangular,
     unproject_point,
 )
-from oswald_globe.undo_stack import BrushPaintCommand, UndoStack
+from oswald_globe.undo_stack import UndoStack, UndoableCommand
 
 SHADERS_DIR = Path(__file__).resolve().parent / "shaders"
 DEFAULT_COLORMAP_VMIN = -32767.0
@@ -208,6 +208,7 @@ class GlobeGLWidget(QOpenGLWidget):
     ):
         super().__init__(parent)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
         self.raw_data = data
@@ -251,8 +252,9 @@ class GlobeGLWidget(QOpenGLWidget):
         self._mouse_over_globe = False
         self._hover_target_lat = 0.0
         self._hover_target_lon = 0.0
+        self._select_alt_mode = False
         self._undo_stack: Optional[UndoStack] = None
-        self._brush_command_factory: Optional[Callable[[Dict[str, Any]], BrushPaintCommand]] = None
+        self._brush_command_factory: Optional[Callable[[Dict[str, Any]], UndoableCommand]] = None
 
         # Downsample data grid for tooltips and texture if needed
         self.data_grid = self._prepare_grid_data(self.raw_data)
@@ -271,9 +273,11 @@ class GlobeGLWidget(QOpenGLWidget):
         self.index_ebo = 0
         self.dual_pos_vbo = 0
         self.dual_line_ebo = 0
+        self.selection_pos_vbo = 0
 
         self.index_count = 0
         self.dual_line_count = 0
+        self.selection_vertex_ranges: Optional[np.ndarray] = None
         self.brush_vbo = 0
         self.brush_vertex_count = 0
         self._gl_initialized = False
@@ -375,6 +379,22 @@ class GlobeGLWidget(QOpenGLWidget):
         self._update_mesh_height_buffer()
         self.update()
 
+    def apply_mesh_selection_values(self, vertex_indices: np.ndarray, values: np.ndarray) -> None:
+        if not self.has_mesh or self.mesh_grid is None:
+            raise RuntimeError("Selection requires a mesh-backed globe.")
+
+        indices = np.asarray(vertex_indices, dtype=np.intp)
+        new_values = np.clip(np.asarray(values, dtype=np.float64), 0.0, 1.0)
+        if indices.shape != new_values.shape:
+            raise ValueError(
+                "Selection update indices and values must have matching shapes, "
+                f"got {indices.shape} and {new_values.shape}."
+            )
+
+        layer = self.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+        layer.values[indices] = new_values
+        self.update()
+
     def _get_colormap(self):
         if isinstance(self.cmap, str):
             if self.cmap.lower() == "topo":
@@ -438,16 +458,19 @@ class GlobeGLWidget(QOpenGLWidget):
         controls_layout.setSpacing(4)
 
         self.btn_zoom_in = QPushButton("+", self.controls_widget)
+        self.btn_zoom_in.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_zoom_in.setProperty("class", "GlobeControlBtn")
         self.btn_zoom_in.setToolTip("Zoom In")
         self.btn_zoom_in.clicked.connect(self.zoom_in)
 
         self.btn_zoom_out = QPushButton("−", self.controls_widget)
+        self.btn_zoom_out.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_zoom_out.setProperty("class", "GlobeControlBtn")
         self.btn_zoom_out.setToolTip("Zoom Out")
         self.btn_zoom_out.clicked.connect(self.zoom_out)
 
         self.btn_reset = QPushButton("⟲", self.controls_widget)
+        self.btn_reset.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_reset.setProperty("class", "GlobeControlBtn")
         self.btn_reset.setToolTip("Reset View")
         self.btn_reset.clicked.connect(self.reset_view)
@@ -455,6 +478,7 @@ class GlobeGLWidget(QOpenGLWidget):
         self.btn_spin = QPushButton("▶" if not self.is_auto_spin else "⏸", self.controls_widget)
         self.btn_spin.setCheckable(True)
         self.btn_spin.setChecked(self.is_auto_spin)
+        self.btn_spin.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_spin.setProperty("class", "GlobeControlBtn")
         self.btn_spin.setToolTip("Toggle Auto-Spin")
         self.btn_spin.clicked.connect(self.toggle_spin)
@@ -462,6 +486,7 @@ class GlobeGLWidget(QOpenGLWidget):
         self.btn_grid = QPushButton("🌐", self.controls_widget)
         self.btn_grid.setCheckable(True)
         self.btn_grid.setChecked(self.is_graticule)
+        self.btn_grid.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_grid.setProperty("class", "GlobeControlBtn")
         self.btn_grid.setToolTip("Toggle Graticule")
         self.btn_grid.clicked.connect(self.toggle_graticule)
@@ -476,6 +501,7 @@ class GlobeGLWidget(QOpenGLWidget):
             self.btn_mesh = QPushButton("⬡", self.controls_widget)
             self.btn_mesh.setCheckable(True)
             self.btn_mesh.setChecked(self.show_wireframe)
+            self.btn_mesh.setCursor(Qt.CursorShape.PointingHandCursor)
             self.btn_mesh.setProperty("class", "GlobeControlBtn")
             self.btn_mesh.setToolTip("Toggle Icosphere Dual (Voronoi) Mesh")
             self.btn_mesh.clicked.connect(self.toggle_mesh_wireframe)
@@ -597,6 +623,8 @@ class GlobeGLWidget(QOpenGLWidget):
 
             dual_positions = grid.dual_vertices()[:, [1, 2, 0]].astype(np.float32)
             dual_line_indices = grid.dual_edges().astype(np.uint32).reshape(-1)
+            selection_positions, self.selection_vertex_ranges = grid.dual_cell_line_segments()
+            selection_positions = selection_positions[:, [1, 2, 0]].astype(np.float32)
         else:
             lat_bands = 64
             lon_bands = 64
@@ -640,6 +668,8 @@ class GlobeGLWidget(QOpenGLWidget):
             indices = np.array(idx_list, dtype=np.uint32)
             dual_positions = None
             dual_line_indices = None
+            selection_positions = None
+            self.selection_vertex_ranges = None
 
         self.index_count = len(indices)
 
@@ -675,6 +705,11 @@ class GlobeGLWidget(QOpenGLWidget):
             glBufferData(GL_ELEMENT_ARRAY_BUFFER, dual_line_indices.nbytes, dual_line_indices, GL_STATIC_DRAW)
         else:
             self.dual_line_count = 0
+
+        if selection_positions is not None and len(selection_positions) > 0:
+            self.selection_pos_vbo = glGenBuffers(1)
+            glBindBuffer(GL_ARRAY_BUFFER, self.selection_pos_vbo)
+            glBufferData(GL_ARRAY_BUFFER, selection_positions.nbytes, selection_positions, GL_STATIC_DRAW)
 
     def _init_textures(self):
         img_data = self._generate_texture_image()
@@ -723,11 +758,13 @@ class GlobeGLWidget(QOpenGLWidget):
     # ---------------- Tool Mode & Paint Brush Preview ----------------
 
     def set_tool_mode(self, mode: str) -> None:
-        """Switch the active interaction tool ("navigate" or "paint")."""
-        mode = mode if mode in ("navigate", "paint") else "navigate"
+        """Switch the active interaction tool ("navigate", "select", or "paint")."""
+        mode = mode if mode in ("navigate", "select", "paint") else "navigate"
         if mode == self.tool_mode:
             return
         self.tool_mode = mode
+        if self.tool_mode != "select":
+            self._select_alt_mode = False
         self.is_dragging = False
         self._refresh_cursor()
         self.update()
@@ -744,7 +781,7 @@ class GlobeGLWidget(QOpenGLWidget):
         radius_deg = min(89.0, max(0.0, float(radius_km) / 111.0))
         self.paint_angular_radius = math.radians(radius_deg)
         self.paint_dropoff_percent = min(100.0, max(0.0, float(dropoff_percent)))
-        if self.tool_mode == "paint":
+        if self.tool_mode in ("paint", "select"):
             self.update()
 
     def set_undo_stack(self, undo_stack: Optional[UndoStack]) -> None:
@@ -752,15 +789,18 @@ class GlobeGLWidget(QOpenGLWidget):
 
     def set_brush_command_factory(
         self,
-        factory: Optional[Callable[[Dict[str, Any]], BrushPaintCommand]],
+        factory: Optional[Callable[[Dict[str, Any]], UndoableCommand]],
     ) -> None:
         self._brush_command_factory = factory
 
     def _refresh_cursor(self) -> None:
+        if self.is_auto_spin and self._mouse_over_globe:
+            self.setCursor(Qt.CursorShape.ForbiddenCursor)
+            return
         if self._middle_dragging:
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
-        if self.tool_mode == "paint":
+        if self.tool_mode in ("paint", "select"):
             if self._mouse_over_globe:
                 self.setCursor(Qt.CursorShape.BlankCursor)
             else:
@@ -774,6 +814,23 @@ class GlobeGLWidget(QOpenGLWidget):
             )
         else:
             self.setCursor(Qt.CursorShape.ForbiddenCursor)
+
+    def _globe_interaction_blocked(self, pt: Optional[Dict[str, Any]]) -> bool:
+        return self.is_auto_spin and pt is not None
+
+    @staticmethod
+    def _event_has_shift_modifier(event: QMouseEvent) -> bool:
+        modifiers = getattr(event, "modifiers", None)
+        if not callable(modifiers):
+            return False
+        return bool(modifiers() & Qt.KeyboardModifier.ShiftModifier)
+
+    @staticmethod
+    def _event_has_alt_modifier(event: QMouseEvent) -> bool:
+        modifiers = getattr(event, "modifiers", None)
+        if not callable(modifiers):
+            return False
+        return bool(modifiers() & Qt.KeyboardModifier.AltModifier)
 
     def paintGL(self):
         if not self._gl_initialized or self.program <= 0 or self.line_program <= 0:
@@ -908,6 +965,8 @@ class GlobeGLWidget(QOpenGLWidget):
             glDepthMask(GL_TRUE)
             glDepthFunc(GL_LESS)
 
+        self._draw_selection_wireframe(p_matrix, mv_matrix)
+
         if not self._first_frame_rendered:
             self._first_frame_rendered = True
             self.firstFrameRendered.emit()
@@ -954,14 +1013,16 @@ class GlobeGLWidget(QOpenGLWidget):
 
     def _draw_brush_overlay(self, p_matrix, mv_matrix) -> None:
         """Draw the paint brush preview circles on the surface of the globe."""
-        if self.tool_mode != "paint" or not self._mouse_over_globe:
+        if self.is_auto_spin:
+            return
+        if self.tool_mode not in ("paint", "select") or not self._mouse_over_globe:
             return
         if self.paint_angular_radius <= 0 or self.line_program <= 0:
             return
 
         inner_radius = self.paint_angular_radius * (self.paint_dropoff_percent / 100.0)
         rings = [self.paint_angular_radius]
-        if inner_radius > 0:
+        if inner_radius > 0 and not (self.tool_mode == "select" and self._select_alt_mode):
             rings.append(inner_radius)
 
         vertices = np.concatenate([self._brush_ring_vertices(r) for r in rings], axis=0)
@@ -988,6 +1049,54 @@ class GlobeGLWidget(QOpenGLWidget):
         glDrawArrays(GL_LINES, 0, self.brush_vertex_count)
         glDepthMask(GL_TRUE)
 
+    def _draw_selection_wireframe(self, p_matrix, mv_matrix) -> None:
+        if (
+            not self.has_mesh
+            or self.mesh_grid is None
+            or self.selection_pos_vbo == 0
+            or self.selection_vertex_ranges is None
+        ):
+            return
+
+        selection_values = np.clip(
+            self.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values,
+            0.0,
+            1.0,
+        )
+        selected_indices = np.flatnonzero(selection_values > 0.0)
+        if selected_indices.size == 0:
+            return
+
+        glUseProgram(self.line_program)
+        line_u_p_matrix = glGetUniformLocation(self.line_program, "uPMatrix")
+        line_u_mv_matrix = glGetUniformLocation(self.line_program, "uMVMatrix")
+        line_u_color = glGetUniformLocation(self.line_program, "uWireframeColor")
+        line_u_opacity = glGetUniformLocation(self.line_program, "uWireframeOpacity")
+        line_a_position = glGetAttribLocation(self.line_program, "aPosition")
+
+        glUniformMatrix4fv(line_u_p_matrix, 1, GL_FALSE, p_matrix)
+        glUniformMatrix4fv(line_u_mv_matrix, 1, GL_FALSE, mv_matrix)
+        glUniform3f(line_u_color, 1.0, 1.0, 1.0)
+
+        glDepthMask(GL_FALSE)
+        glDepthFunc(GL_LEQUAL)
+        if line_a_position >= 0:
+            glEnableVertexAttribArray(line_a_position)
+            glBindBuffer(GL_ARRAY_BUFFER, self.selection_pos_vbo)
+            raw_glVertexAttribPointer(line_a_position, 3, GL_FLOAT, GL_FALSE, 0, None)
+
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        for vertex_index in selected_indices:
+            start, count = self.selection_vertex_ranges[vertex_index]
+            if count <= 0:
+                continue
+            glUniform1f(line_u_opacity, float(selection_values[vertex_index]))
+            glDrawArrays(GL_LINES, int(start), int(count))
+        glDisable(GL_BLEND)
+        glDepthMask(GL_TRUE)
+        glDepthFunc(GL_LESS)
+
     # ---------------- Mouse & Animation Handlers ----------------
 
     def _on_anim_tick(self):
@@ -1009,7 +1118,34 @@ class GlobeGLWidget(QOpenGLWidget):
             self.update()
 
     def mousePressEvent(self, event: QMouseEvent):
+        self._select_alt_mode = self.tool_mode == "select" and self._event_has_alt_modifier(event)
+        pt = unproject_point(
+            event.position().x(),
+            event.position().y(),
+            self.width(),
+            self.height(),
+            self.zoom,
+            self.center_lat,
+            self.center_lon,
+            self.data_grid,
+        )
+        if self._globe_interaction_blocked(pt):
+            self._mouse_over_globe = True
+            self._refresh_cursor()
+            QToolTip.hideText()
+            return
+
         if event.button() == Qt.MouseButton.LeftButton:
+            if self.tool_mode == "select" and pt is not None:
+                erase_selection = self._event_has_alt_modifier(event)
+                replace_existing = not erase_selection and not self._event_has_shift_modifier(event)
+                self._apply_brush_at_position(
+                    pt,
+                    replace_existing=replace_existing,
+                    erase_selection=erase_selection,
+                )
+                self.update()
+                return
             if self.tool_mode == "navigate":
                 self.is_dragging = True
                 self._refresh_cursor()
@@ -1036,6 +1172,7 @@ class GlobeGLWidget(QOpenGLWidget):
         pt = unproject_point(
             x, y, self.width(), self.height(), self.zoom, self.center_lat, self.center_lon, self.data_grid
         )
+        self._select_alt_mode = self.tool_mode == "select" and self._event_has_alt_modifier(event)
         was_over_globe = self._mouse_over_globe
         self._mouse_over_globe = pt is not None
         if pt is not None:
@@ -1043,9 +1180,18 @@ class GlobeGLWidget(QOpenGLWidget):
             self._hover_target_lon = pt["target_lon"]
         if was_over_globe != self._mouse_over_globe:
             self._refresh_cursor()
+        elif self._mouse_over_globe and self.is_auto_spin:
+            self._refresh_cursor()
 
-        if self.tool_mode == "paint" and (event.buttons() & Qt.MouseButton.LeftButton):
-            self._paint_at_position(pt)
+        if self._globe_interaction_blocked(pt):
+            QToolTip.hideText()
+            return
+
+        if self.tool_mode in ("paint", "select") and (event.buttons() & Qt.MouseButton.LeftButton):
+            self._apply_brush_at_position(
+                pt,
+                erase_selection=self.tool_mode == "select" and self._event_has_alt_modifier(event),
+            )
             self.update()
             return
 
@@ -1066,7 +1212,7 @@ class GlobeGLWidget(QOpenGLWidget):
             self.update()
         else:
             self._update_tooltip(x, y)
-            if self.tool_mode == "paint":
+            if self.tool_mode in ("paint", "select"):
                 self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent):
@@ -1075,12 +1221,18 @@ class GlobeGLWidget(QOpenGLWidget):
 
         x = event.position().x()
         y = event.position().y()
+        pt = unproject_point(
+            x, y, self.width(), self.height(), self.zoom, self.center_lat, self.center_lon, self.data_grid
+        )
+
+        if self._globe_interaction_blocked(pt):
+            self._mouse_over_globe = True
+            self._refresh_cursor()
+            QToolTip.hideText()
+            return
 
         if event.button() == Qt.MouseButton.LeftButton and self.tool_mode == "paint":
-            pt = unproject_point(
-                x, y, self.width(), self.height(), self.zoom, self.center_lat, self.center_lon, self.data_grid
-            )
-            self._paint_at_position(pt)
+            self._apply_brush_at_position(pt)
             self.update()
             return
 
@@ -1091,8 +1243,15 @@ class GlobeGLWidget(QOpenGLWidget):
             self._refresh_cursor()
             self._emit_center()
             self.update()
+        self._select_alt_mode = False
 
-    def _paint_at_position(self, pt: Optional[Dict[str, Any]]) -> None:
+    def _apply_brush_at_position(
+        self,
+        pt: Optional[Dict[str, Any]],
+        *,
+        replace_existing: bool = False,
+        erase_selection: bool = False,
+    ) -> None:
         if pt is None:
             self._mouse_over_globe = False
             self._refresh_cursor()
@@ -1105,14 +1264,17 @@ class GlobeGLWidget(QOpenGLWidget):
         if self._brush_command_factory is None or self._undo_stack is None:
             raise RuntimeError("Brush command handling has not been configured.")
 
-        command = self._brush_command_factory(
-            {
-                "target_lat_deg": math.degrees(pt["target_lat"]),
-                "target_lon_deg": math.degrees(pt["target_lon"]),
-                "radius_km": self._paint_brush_radius_km,
-                "falloff_percent": self.paint_dropoff_percent,
-            }
-        )
+        payload = {
+            "target_lat_deg": math.degrees(pt["target_lat"]),
+            "target_lon_deg": math.degrees(pt["target_lon"]),
+            "radius_km": self._paint_brush_radius_km,
+            "falloff_percent": self.paint_dropoff_percent,
+        }
+        if replace_existing:
+            payload["replace_existing"] = True
+        if erase_selection:
+            payload["erase_selection"] = True
+        command = self._brush_command_factory(payload)
         self._undo_stack.push(command)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
@@ -1122,6 +1284,11 @@ class GlobeGLWidget(QOpenGLWidget):
             pt = unproject_point(
                 x, y, self.width(), self.height(), self.zoom, self.center_lat, self.center_lon, self.data_grid
             )
+            if self._globe_interaction_blocked(pt):
+                self._mouse_over_globe = True
+                self._refresh_cursor()
+                QToolTip.hideText()
+                return
             if pt is not None:
                 self.center_lat = pt["target_lat"]
                 self.center_lon = pt["target_lon"]
@@ -1132,6 +1299,21 @@ class GlobeGLWidget(QOpenGLWidget):
                 self.update()
 
     def wheelEvent(self, event: QWheelEvent):
+        pt = unproject_point(
+            event.position().x(),
+            event.position().y(),
+            self.width(),
+            self.height(),
+            self.zoom,
+            self.center_lat,
+            self.center_lon,
+            self.data_grid,
+        )
+        if self._globe_interaction_blocked(pt):
+            self._mouse_over_globe = True
+            self._refresh_cursor()
+            QToolTip.hideText()
+            return
         delta = event.angleDelta().y()
         zoom_factor = math.exp(delta * 0.0015)
         self.zoom = max(self.min_zoom, min(self.max_zoom, self.zoom * zoom_factor))
@@ -1143,12 +1325,27 @@ class GlobeGLWidget(QOpenGLWidget):
         QToolTip.hideText()
         self._mouse_pos = None
         self._mouse_over_globe = False
+        self._select_alt_mode = False
         super().leaveEvent(event)
-        if self.tool_mode == "paint":
+        if self.tool_mode in ("paint", "select"):
             self.update()
 
+    def keyPressEvent(self, event) -> None:
+        if self.tool_mode == "select" and event.key() == Qt.Key.Key_Alt:
+            self._select_alt_mode = True
+            if self._mouse_over_globe:
+                self.update()
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:
+        if self.tool_mode == "select" and event.key() == Qt.Key.Key_Alt:
+            self._select_alt_mode = False
+            if self._mouse_over_globe:
+                self.update()
+        super().keyReleaseEvent(event)
+
     def _update_tooltip(self, client_x: float, client_y: float):
-        if self.is_dragging:
+        if self.is_dragging or self.is_auto_spin:
             QToolTip.hideText()
             return
 

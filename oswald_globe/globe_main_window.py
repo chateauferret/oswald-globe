@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from threading import Event
 from pathlib import Path
@@ -45,10 +46,11 @@ try:
     from .icosphere_build_worker import IcosphereBuildWorker
     from .icosphere_progress_dialog import IcosphereProgressDialog
     from .paint_tool import PaintTool
+    from .select_tool import SelectTool
     from .project import Project
     from .settings_dialog import SettingsDialog
     from .tool import NavigateTool, Tool
-    from .undo_stack import BrushPaintCommand, UndoStack
+    from .undo_stack import BrushPaintCommand, SelectionBrushCommand, SelectionLayerCommand, UndoStack
 except ImportError:  # pragma: no cover - supports running as a script
     from oswald_globe import resources_rc  # noqa: F401
     from oswald_globe.app_support import APP_SETTINGS, DEFAULT_HEIGHTFIELD, empty_globe_elevation, generic_icosphere_mesh, load_elevation
@@ -58,10 +60,11 @@ except ImportError:  # pragma: no cover - supports running as a script
     from oswald_globe.icosphere_build_worker import IcosphereBuildWorker
     from oswald_globe.icosphere_progress_dialog import IcosphereProgressDialog
     from oswald_globe.paint_tool import PaintTool
+    from oswald_globe.select_tool import SelectTool
     from oswald_globe.project import Project
     from oswald_globe.settings_dialog import SettingsDialog
     from oswald_globe.tool import NavigateTool, Tool
-    from oswald_globe.undo_stack import BrushPaintCommand, UndoStack
+    from oswald_globe.undo_stack import BrushPaintCommand, SelectionBrushCommand, SelectionLayerCommand, UndoStack
 
 
 def _write_tiff_export(path: Path, raster: np.ndarray) -> None:
@@ -399,12 +402,14 @@ class GlobeMainWindow(QMainWindow):
         self._undo_stack = UndoStack(on_changed=self._on_project_state_changed)
         self._tools: Dict[str, Tool] = {
             "navigate": NavigateTool(self),
+            "select": SelectTool(self),
             "paint": PaintTool(self),
         }
         self._active_tool: Optional[Tool] = None
         self._active_tool_name: Optional[str] = None
         self._file_menu: Optional[QMenu] = None
         self._edit_menu: Optional[QMenu] = None
+        self._select_menu: Optional[QMenu] = None
         self._undo_action: Optional[QAction] = None
         self._redo_action: Optional[QAction] = None
         self._tools_menu: Optional[QMenu] = None
@@ -488,6 +493,20 @@ class GlobeMainWindow(QMainWindow):
         self._redo_action.triggered.connect(self._undo_stack.redo)
         self._edit_menu.addAction(self._redo_action)
 
+        self._select_menu = self.menuBar().addMenu("Select")
+
+        select_all_action = QAction("All", self)
+        select_all_action.triggered.connect(self.select_all_vertices)
+        self._select_menu.addAction(select_all_action)
+
+        select_none_action = QAction("None", self)
+        select_none_action.triggered.connect(self.select_no_vertices)
+        self._select_menu.addAction(select_none_action)
+
+        select_invert_action = QAction("Invert", self)
+        select_invert_action.triggered.connect(self.invert_vertex_selection)
+        self._select_menu.addAction(select_invert_action)
+
         self._tools_menu = self.menuBar().addMenu("Tools")
         self._tool_action_group = QActionGroup(self._tools_menu)
         self._tool_action_group.setExclusive(True)
@@ -496,6 +515,12 @@ class GlobeMainWindow(QMainWindow):
             self._tools_menu,
             self._tool_action_group,
             on_selected=lambda: self._set_active_tool("navigate"),
+        )
+
+        self._tools["select"].create_menu_action(
+            self._tools_menu,
+            self._tool_action_group,
+            on_selected=lambda: self._set_active_tool("select"),
         )
 
         self._tools["paint"].create_menu_action(
@@ -532,10 +557,16 @@ class GlobeMainWindow(QMainWindow):
         if gl_widget is None:
             return
         gl_widget.set_tool_mode(self._active_tool_name or "navigate")
+        brush_tool = self._tools.get(self._active_tool_name or "")
+        if isinstance(brush_tool, (PaintTool, SelectTool)):
+            gl_widget.set_paint_brush(brush_tool.radius_km(), brush_tool.falloff_percent())
         paint_tool = self._tools.get("paint")
-        if isinstance(paint_tool, PaintTool):
-            gl_widget.set_paint_brush(paint_tool.radius_km(), paint_tool.falloff_percent())
+        if self._active_tool_name == "paint":
             gl_widget.set_brush_command_factory(self._create_brush_command)
+        elif self._active_tool_name == "select":
+            gl_widget.set_brush_command_factory(self._create_select_command)
+        else:
+            gl_widget.set_brush_command_factory(None)
         gl_widget.set_undo_stack(self._undo_stack)
 
     def _create_brush_command(self, payload: Dict[str, object]) -> BrushPaintCommand:
@@ -556,6 +587,57 @@ class GlobeMainWindow(QMainWindow):
             mesh_grid=mesh_grid,
             apply_vertex_values=self.viewer.gl_widget.apply_mesh_vertex_values,
         )
+
+    def _create_select_command(self, payload: Dict[str, object]) -> SelectionBrushCommand:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Select tool requires a mesh-backed globe.")
+
+        return SelectionBrushCommand(
+            target_lat_deg=float(payload["target_lat_deg"]),
+            target_lon_deg=float(payload["target_lon_deg"]),
+            radius_km=float(payload["radius_km"]),
+            falloff_percent=float(payload["falloff_percent"]),
+            replace_existing=bool(payload.get("replace_existing", False)),
+            erase_selection=bool(payload.get("erase_selection", False)),
+            mesh_grid=mesh_grid,
+            apply_selection_values=self.viewer.gl_widget.apply_mesh_selection_values,
+        )
+
+    def _create_selection_layer_command(self, after_values: np.ndarray) -> SelectionLayerCommand:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Selection operations require a mesh-backed globe.")
+        return SelectionLayerCommand(
+            mesh_grid=mesh_grid,
+            after_values=after_values,
+            apply_selection_values=self.viewer.gl_widget.apply_mesh_selection_values,
+        )
+
+    @Slot()
+    def select_all_vertices(self) -> None:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Select All requires a mesh-backed globe.")
+        command = self._create_selection_layer_command(np.ones(mesh_grid.vertex_count(), dtype=np.float64))
+        self._undo_stack.push(command)
+
+    @Slot()
+    def select_no_vertices(self) -> None:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Select None requires a mesh-backed globe.")
+        command = self._create_selection_layer_command(np.zeros(mesh_grid.vertex_count(), dtype=np.float64))
+        self._undo_stack.push(command)
+
+    @Slot()
+    def invert_vertex_selection(self) -> None:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Invert Selection requires a mesh-backed globe.")
+        selection_values = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values
+        command = self._create_selection_layer_command(1.0 - selection_values)
+        self._undo_stack.push(command)
 
     def _sync_edit_actions(self) -> None:
         if self._undo_action is not None:
@@ -1351,6 +1433,14 @@ def _configure_opengl_surface_format() -> None:
     QSurfaceFormat.setDefaultFormat(fmt)
 
 
+def _configure_qt_opengl_backend() -> None:
+    os.environ.setdefault("QT_OPENGL", "desktop")
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("QT_XCB_GL_INTEGRATION", "xcb_glx")
+    if QApplication.instance() is None:
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseDesktopOpenGL, True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Interactive 3D heightfield desktop globe.")
     parser.add_argument("--heightfield", type=Path, default=None, help="Optional raster file to load. Defaults to a sea-level globe.")
@@ -1361,6 +1451,7 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=900, help="Window height in pixels.")
     args = parser.parse_args()
 
+    _configure_qt_opengl_backend()
     _configure_opengl_surface_format()
 
     app = QApplication.instance()

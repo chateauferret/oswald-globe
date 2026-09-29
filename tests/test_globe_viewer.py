@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from PIL import Image
+from PySide6.QtCore import Qt
 
 try:
     import rasterio
@@ -132,6 +133,19 @@ def test_globe_viewer_mesh_mode(qapp):
     assert isinstance(viewer.mesh_grid, IcosphereGrid)
     assert viewer.gl_widget.has_mesh is True
     assert viewer.gl_widget.btn_mesh is not None
+
+
+def test_globe_viewer_overlay_buttons_use_pointing_hand_cursor(qapp):
+    arr = np.zeros((64, 128), dtype=np.float32)
+    viewer = GlobeViewer(arr, mesh=True, mesh_min_level=1, mesh_max_level=3)
+
+    assert viewer.gl_widget.btn_zoom_in.cursor().shape() == Qt.CursorShape.PointingHandCursor
+    assert viewer.gl_widget.btn_zoom_out.cursor().shape() == Qt.CursorShape.PointingHandCursor
+    assert viewer.gl_widget.btn_reset.cursor().shape() == Qt.CursorShape.PointingHandCursor
+    assert viewer.gl_widget.btn_spin.cursor().shape() == Qt.CursorShape.PointingHandCursor
+    assert viewer.gl_widget.btn_grid.cursor().shape() == Qt.CursorShape.PointingHandCursor
+    assert viewer.gl_widget.btn_mesh is not None
+    assert viewer.gl_widget.btn_mesh.cursor().shape() == Qt.CursorShape.PointingHandCursor
 
 
 def test_globe_viewer_centre_method(qapp):

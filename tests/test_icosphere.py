@@ -90,7 +90,7 @@ def test_layers_support_metadata_and_ordered_storage():
         z_index=5,
     )
 
-    assert grid.layer_names() == ["elevation", "temperature"]
+    assert grid.layer_names() == ["elevation", "selection_status", "temperature"]
     assert elevation.name == "elevation"
     assert elevation.description == "Terrain height"
     assert elevation.opacity == 65.0
@@ -103,6 +103,44 @@ def test_layers_support_metadata_and_ordered_storage():
     assert temp.legend.name == "thermal"
     assert temp.legend.colormap is thermal_cmap
     assert temp.z_index == 5
+
+
+def test_selection_layer_defaults_to_zero():
+    grid = IcosphereGrid()
+
+    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+
+    np.testing.assert_allclose(selection.values, 0.0)
+    assert grid.has_selection is False
+
+
+def test_has_selection_tracks_positive_selection_values():
+    grid = IcosphereGrid()
+
+    assert grid.has_selection is False
+
+    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+    selection.values[0] = 0.25
+
+    assert grid.has_selection is True
+
+    selection.values[:] = 0.0
+
+    assert grid.has_selection is False
+
+
+def test_dual_cell_line_segments_cover_vertex_cells():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(1)
+
+    segments, ranges = grid.dual_cell_line_segments()
+
+    assert segments.ndim == 2
+    assert segments.shape[1] == 3
+    assert ranges.shape == (grid.vertex_count(), 2)
+    assert np.all(ranges[:, 1] > 0)
+    assert np.all(ranges[:, 1] % 2 == 0)
+    assert np.max(ranges[:, 0] + ranges[:, 1], initial=0) == len(segments)
 
 
 def test_adaptive_refinement_is_2_1_balanced():

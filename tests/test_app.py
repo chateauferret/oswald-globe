@@ -9,7 +9,9 @@ from PySide6.QtCore import QDir, QSettings, Qt, QPointF
 from PySide6.QtGui import QColor, QCloseEvent
 from PySide6.QtWidgets import QComboBox, QFileDialog, QMessageBox, QProgressBar, QSlider, QSpinBox, QToolTip
 
+import oswald_globe.app as app_module
 from oswald_globe.app import IcosphereProgressDialog, create_window, load_elevation
+from oswald_globe import globe_main_window
 from oswald_globe.globe_main_window import (
     TiffExportProgressDialog,
     TiffImportProgressDialog,
@@ -18,7 +20,7 @@ from oswald_globe.globe_main_window import (
 )
 from oswald_globe.icosphere_grid import IcosphereGrid
 from oswald_globe.project import Project
-from oswald_globe.undo_stack import BrushPaintCommand, UndoStack
+from oswald_globe.undo_stack import BrushPaintCommand, SelectionBrushCommand, UndoStack
 
 
 def _project_window_title(window) -> str:
@@ -73,6 +75,48 @@ def test_app_help_when_run_as_script():
     assert "Interactive 3D heightfield desktop globe." in result.stdout
 
 
+def test_configure_qt_opengl_backend_prefers_glx_on_linux(monkeypatch: pytest.MonkeyPatch):
+    class FakeApplication:
+        calls = []
+
+        @staticmethod
+        def instance():
+            return None
+
+        @staticmethod
+        def setAttribute(attribute, enabled=True):
+            FakeApplication.calls.append((attribute, enabled))
+
+    monkeypatch.setattr(globe_main_window, "QApplication", FakeApplication)
+    monkeypatch.setattr(globe_main_window.sys, "platform", "linux")
+    monkeypatch.delenv("QT_OPENGL", raising=False)
+    monkeypatch.delenv("QT_XCB_GL_INTEGRATION", raising=False)
+
+    globe_main_window._configure_qt_opengl_backend()
+
+    assert os.environ["QT_OPENGL"] == "desktop"
+    assert os.environ["QT_XCB_GL_INTEGRATION"] == "xcb_glx"
+    assert FakeApplication.calls == [(Qt.ApplicationAttribute.AA_UseDesktopOpenGL, True)]
+
+
+def test_configure_qt_runtime_environment_pins_nvidia_egl_vendor(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    monkeypatch.delenv("QT_OPENGL", raising=False)
+    monkeypatch.delenv("QT_XCB_GL_INTEGRATION", raising=False)
+    monkeypatch.delenv("__EGL_VENDOR_LIBRARY_FILENAMES", raising=False)
+    monkeypatch.setattr(
+        app_module,
+        "_find_nvidia_egl_vendor_library_file",
+        lambda: "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+    )
+
+    app_module._configure_qt_runtime_environment()
+
+    assert os.environ["QT_OPENGL"] == "desktop"
+    assert os.environ["QT_XCB_GL_INTEGRATION"] == "xcb_glx"
+    assert os.environ["__EGL_VENDOR_LIBRARY_FILENAMES"] == "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+
+
 def test_create_window(qapp, tmp_path: Path):
     tif_path = tmp_path / "globe.tif"
     arr = np.zeros((32, 64), dtype=np.float32)
@@ -92,7 +136,7 @@ def test_create_window(qapp, tmp_path: Path):
     assert window.windowTitle().endswith("[*]")
     assert _project_window_title(window) == "globe"
     assert window.centralWidget() is not None
-    assert [action.text() for action in window.menuBar().actions()] == ["File", "Edit", "Tools", "View"]
+    assert [action.text() for action in window.menuBar().actions()] == ["File", "Edit", "Select", "Tools", "View"]
     assert window._file_menu is not None
     assert [action.text() for action in window._file_menu.actions() if action.text()] == [
         "New",
@@ -107,8 +151,10 @@ def test_create_window(qapp, tmp_path: Path):
     assert window._edit_menu is not None
     assert [action.text() for action in window._edit_menu.actions()] == ["Undo", "Redo"]
     assert [action.isEnabled() for action in window._edit_menu.actions()] == [False, False]
+    assert window._select_menu is not None
+    assert [action.text() for action in window._select_menu.actions()] == ["All", "None", "Invert"]
     assert window._tools_menu is not None
-    assert [action.text() for action in window._tools_menu.actions()] == ["Navigate", "Paint"]
+    assert [action.text() for action in window._tools_menu.actions()] == ["Navigate", "Select", "Paint"]
     assert [action.text() for action in window._tools_menu.actions() if action.isChecked()] == ["Navigate"]
 
     assert window._legend_menu is not None
@@ -382,12 +428,15 @@ def test_paint_tool_selection_shows_options_and_navigate_disposes(qapp):
     try:
         assert window._tools_menu is not None
         tools_menu = window._tools_menu
-        navigate_action, paint_action = tools_menu.actions()
+        navigate_action, select_action, paint_action = tools_menu.actions()
         paint_tool = window._tools["paint"]
+        select_tool = window._tools["select"]
 
         assert navigate_action.isChecked() is True
+        assert select_action.isChecked() is False
         assert paint_action.isChecked() is False
         assert paint_tool.options_dialog is None
+        assert select_tool.options_dialog is None
 
         paint_action.trigger()
         assert paint_action.isChecked() is True
@@ -465,6 +514,36 @@ def test_paint_tool_selection_shows_options_and_navigate_disposes(qapp):
         assert paint_tool.options_dialog.value_spin.value() == 317
         assert paint_tool.options_dialog.radius_spin.value() == 494
         assert paint_tool.options_dialog.falloff_spin.value() == 6
+
+        select_action.trigger()
+        assert select_action.isChecked() is True
+        assert navigate_action.isChecked() is False
+        assert paint_action.isChecked() is False
+        assert paint_tool.options_dialog is None
+        assert select_tool.options_dialog is not None
+        assert select_tool.options_dialog.windowTitle() == "Select Tool Options"
+
+        sliders = select_tool.options_dialog.findChildren(QSlider)
+        ranges = sorted((slider.minimum(), slider.maximum()) for slider in sliders if slider.isVisible())
+        assert ranges == [(0, 100), (0, 1000)]
+        spin_boxes = select_tool.options_dialog.findChildren(QSpinBox)
+        spin_ranges = sorted((spin.minimum(), spin.maximum()) for spin in spin_boxes if spin.isVisible())
+        assert spin_ranges == [(0, 100), (0, 1000)]
+        mode_combo = select_tool.options_dialog.findChild(QComboBox)
+        assert mode_combo is not None
+        assert mode_combo.isHidden() is True
+        assert select_tool.options_dialog.radius_spin.value() == 100
+        assert select_tool.options_dialog.falloff_spin.value() == 50
+
+        select_tool.options_dialog.radius_slider.setValue(321)
+        select_tool.options_dialog.falloff_slider.setValue(12)
+        assert select_tool.radius_km() == 321
+        assert select_tool.falloff_percent() == 12
+
+        navigate_action.trigger()
+        assert select_tool.options_dialog is None
+        assert select_tool.radius_km() == 321
+        assert select_tool.falloff_percent() == 12
     finally:
         window.close()
 
@@ -526,6 +605,221 @@ def test_brush_command_applies_selected_mode_and_tapers_outer_ring(paint_mode, p
 
     command.undo()
     np.testing.assert_allclose(grid.get_layer("elevation").values, original)
+
+
+def test_brush_command_applies_without_selection_when_has_selection_is_false():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(1)
+    original = np.linspace(0.0, 100.0, grid.vertex_count(), dtype=np.float64)
+    grid.set_layer("elevation", original.copy())
+    grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values[:] = 0.0
+
+    lat_deg, lon_deg = grid.vertex_lat_lon()
+    target_index = 0
+
+    command = BrushPaintCommand(
+        target_lat_deg=float(lat_deg[target_index]),
+        target_lon_deg=float(lon_deg[target_index]),
+        radius_km=8000.0,
+        falloff_percent=50.0,
+        paint_value=8,
+        paint_mode="Add",
+        mesh_grid=grid,
+        apply_vertex_values=lambda indices, values: grid.get_layer("elevation").values.__setitem__(indices, values),
+    )
+
+    command.redo()
+
+    assert grid.has_selection is False
+    np.testing.assert_allclose(
+        grid.get_layer("elevation").values[command.vertex_indices],
+        command.after_values,
+    )
+
+
+def test_brush_command_multiplies_effect_by_selection_status():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(1)
+    original = np.linspace(0.0, 100.0, grid.vertex_count(), dtype=np.float64)
+    grid.set_layer("elevation", original.copy())
+    reference_grid = IcosphereGrid()
+    reference_grid.subdivide_uniform(1)
+    reference_grid.set_layer("elevation", original.copy())
+
+    lat_deg, lon_deg = grid.vertex_lat_lon()
+    target_index = 0
+    radius_km = 8000.0
+    falloff_percent = 50.0
+
+    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+    selection.values[:] = 0.0
+
+    center = grid.vertices[target_index]
+    distances = np.arccos(np.clip(grid.vertices @ center, -1.0, 1.0))
+    outer_radius = np.deg2rad(min(89.0, radius_km / 111.0))
+    selected_indices = np.flatnonzero(distances <= outer_radius + 1e-9)
+    assert selected_indices.size > 0
+
+    selection.values[selected_indices] = np.linspace(0.25, 1.0, selected_indices.size, dtype=np.float64)
+    assert grid.has_selection is True
+
+    reference_command = BrushPaintCommand(
+        target_lat_deg=float(lat_deg[target_index]),
+        target_lon_deg=float(lon_deg[target_index]),
+        radius_km=radius_km,
+        falloff_percent=falloff_percent,
+        paint_value=8,
+        paint_mode="Add",
+        mesh_grid=reference_grid,
+        apply_vertex_values=lambda indices, values: reference_grid.get_layer("elevation").values.__setitem__(indices, values),
+    )
+    command = BrushPaintCommand(
+        target_lat_deg=float(lat_deg[target_index]),
+        target_lon_deg=float(lon_deg[target_index]),
+        radius_km=radius_km,
+        falloff_percent=falloff_percent,
+        paint_value=8,
+        paint_mode="Add",
+        mesh_grid=grid,
+        apply_vertex_values=lambda indices, values: grid.get_layer("elevation").values.__setitem__(indices, values),
+    )
+
+    command.redo()
+
+    selection_weights = selection.values[command.vertex_indices]
+    unselected_mask = selection_weights == 0.0
+    selected_mask = selection_weights > 0.0
+
+    assert np.any(selected_mask)
+    expected_after_values = command.before_values + selection_weights * (reference_command.after_values - command.before_values)
+    np.testing.assert_allclose(command.after_values, expected_after_values, atol=1e-6)
+    if np.any(unselected_mask):
+        np.testing.assert_allclose(command.after_values[unselected_mask], command.before_values[unselected_mask])
+
+
+def test_selection_brush_command_marks_vertices_with_soft_falloff():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(1)
+    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+    selection.values[:] = 0.0
+
+    lat_deg, lon_deg = grid.vertex_lat_lon()
+    target_index = 0
+    radius_km = 8000.0
+    falloff_percent = 50.0
+
+    command = SelectionBrushCommand(
+        target_lat_deg=float(lat_deg[target_index]),
+        target_lon_deg=float(lon_deg[target_index]),
+        radius_km=radius_km,
+        falloff_percent=falloff_percent,
+        replace_existing=False,
+        erase_selection=False,
+        mesh_grid=grid,
+        apply_selection_values=lambda indices, values: selection.values.__setitem__(indices, values),
+    )
+
+    center = grid.vertices[target_index]
+    distances = np.arccos(np.clip(grid.vertices @ center, -1.0, 1.0))
+    outer_radius = np.deg2rad(min(89.0, radius_km / 111.0))
+    inner_radius = outer_radius * (falloff_percent / 100.0)
+    inner_mask = distances <= inner_radius + 1e-9
+    transition_mask = (distances > inner_radius + 1e-9) & (distances <= outer_radius + 1e-9)
+
+    assert np.any(inner_mask)
+    assert np.any(transition_mask)
+
+    command.redo()
+
+    np.testing.assert_allclose(selection.values[inner_mask], 1.0)
+    expected_transition = (outer_radius - distances[transition_mask]) / (outer_radius - inner_radius)
+    np.testing.assert_allclose(selection.values[transition_mask], expected_transition)
+
+    command.undo()
+    np.testing.assert_allclose(selection.values, 0.0)
+
+
+def test_selection_brush_command_can_replace_existing_selection():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(1)
+    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+    selection.values[:] = 1.0
+
+    lat_deg, lon_deg = grid.vertex_lat_lon()
+    target_index = 0
+
+    command = SelectionBrushCommand(
+        target_lat_deg=float(lat_deg[target_index]),
+        target_lon_deg=float(lon_deg[target_index]),
+        radius_km=8000.0,
+        falloff_percent=50.0,
+        replace_existing=True,
+        erase_selection=False,
+        mesh_grid=grid,
+        apply_selection_values=lambda indices, values: selection.values.__setitem__(indices, values),
+    )
+
+    command.redo()
+
+    assert command.vertex_indices.shape == (grid.vertex_count(),)
+    assert np.any(selection.values == 0.0)
+    assert np.max(selection.values) == pytest.approx(1.0)
+
+    command.undo()
+    np.testing.assert_allclose(selection.values, 1.0)
+
+
+def test_selection_brush_command_can_erase_without_clearing_unaffected_vertices():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(1)
+    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+    selection.values[:] = 1.0
+
+    lat_deg, lon_deg = grid.vertex_lat_lon()
+    target_index = 0
+
+    command = SelectionBrushCommand(
+        target_lat_deg=float(lat_deg[target_index]),
+        target_lon_deg=float(lon_deg[target_index]),
+        radius_km=8000.0,
+        falloff_percent=50.0,
+        replace_existing=False,
+        erase_selection=True,
+        mesh_grid=grid,
+        apply_selection_values=lambda indices, values: selection.values.__setitem__(indices, values),
+    )
+
+    command.redo()
+
+    assert np.any(command.after_values == 0.0)
+    unaffected = np.setdiff1d(np.arange(grid.vertex_count(), dtype=np.intp), command.vertex_indices)
+    if unaffected.size:
+        np.testing.assert_allclose(selection.values[unaffected], 1.0)
+
+    command.undo()
+    np.testing.assert_allclose(selection.values, 1.0)
+
+
+def test_selection_layer_command_bulk_updates_and_undo():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(1)
+    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+    selection.values[:] = np.linspace(0.0, 1.0, grid.vertex_count(), dtype=np.float64)
+
+    from oswald_globe.undo_stack import SelectionLayerCommand
+
+    target = np.ones(grid.vertex_count(), dtype=np.float64)
+    command = SelectionLayerCommand(
+        mesh_grid=grid,
+        after_values=target,
+        apply_selection_values=lambda indices, values: selection.values.__setitem__(indices, values),
+    )
+
+    command.redo()
+    np.testing.assert_allclose(selection.values, 1.0)
+
+    command.undo()
+    np.testing.assert_allclose(selection.values, np.linspace(0.0, 1.0, grid.vertex_count(), dtype=np.float64))
 
 
 def test_paint_brush_release_pushes_undo_command(qapp, monkeypatch: pytest.MonkeyPatch):
@@ -744,6 +1038,379 @@ def test_middle_drag_pans_globe_in_paint_mode(qapp, monkeypatch: pytest.MonkeyPa
         window.close()
 
 
+def test_select_tool_applies_selection_and_shows_brush_hover(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        widget = window.viewer.gl_widget
+        widget.set_tool_mode("select")
+
+        updates = []
+        monkeypatch.setattr(widget, "update", lambda: updates.append(True))
+        monkeypatch.setattr(
+            "oswald_globe.globe_widget.unproject_point",
+            lambda *args, **kwargs: {
+                "target_lat": 0.5,
+                "target_lon": -1.0,
+                "value": 0.0,
+                "lat_deg": 0.0,
+                "lon_deg": 0.0,
+            },
+        )
+
+        widget.set_undo_stack(UndoStack())
+        widget.set_brush_command_factory(window._create_select_command)
+
+        class SelectEvent:
+            def __init__(self, x: float, y: float):
+                self._pos = QPointF(x, y)
+
+            def button(self):
+                return Qt.MouseButton.LeftButton
+
+            def buttons(self):
+                return Qt.MouseButton.LeftButton
+
+            def position(self):
+                return self._pos
+
+        widget.mouseMoveEvent(SelectEvent(12.0, 34.0))
+        widget.mouseReleaseEvent(SelectEvent(12.0, 34.0))
+
+        selection = widget.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values
+        assert widget._hover_target_lat == pytest.approx(0.5)
+        assert widget._hover_target_lon == pytest.approx(-1.0)
+        assert widget.cursor().shape() == Qt.CursorShape.BlankCursor
+        assert np.max(selection) > 0.0
+        assert updates
+    finally:
+        window.close()
+
+
+def test_select_tool_alt_hover_draws_only_outer_brush_ring(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        widget = window.viewer.gl_widget
+        widget.set_tool_mode("select")
+        widget._mouse_over_globe = True
+        widget.line_program = 1
+        widget.paint_angular_radius = 1.0
+        widget.paint_dropoff_percent = 50.0
+        widget._select_alt_mode = True
+
+        ring_calls = []
+
+        monkeypatch.setattr(widget, "_brush_ring_vertices", lambda radius: ring_calls.append(radius) or np.zeros((2, 3), dtype=np.float32))
+        monkeypatch.setattr("oswald_globe.globe_widget.glGenBuffers", lambda *_args, **_kwargs: 1)
+        monkeypatch.setattr("oswald_globe.globe_widget.glBindBuffer", lambda *args, **kwargs: None)
+        monkeypatch.setattr("oswald_globe.globe_widget.glBufferData", lambda *args, **kwargs: None)
+        monkeypatch.setattr("oswald_globe.globe_widget.glUseProgram", lambda *args, **kwargs: None)
+        monkeypatch.setattr("oswald_globe.globe_widget.glGetUniformLocation", lambda *args, **kwargs: 0)
+        monkeypatch.setattr("oswald_globe.globe_widget.glUniformMatrix4fv", lambda *args, **kwargs: None)
+        monkeypatch.setattr("oswald_globe.globe_widget.glUniform3f", lambda *args, **kwargs: None)
+        monkeypatch.setattr("oswald_globe.globe_widget.glUniform1f", lambda *args, **kwargs: None)
+        monkeypatch.setattr("oswald_globe.globe_widget.glGetAttribLocation", lambda *args, **kwargs: -1)
+        monkeypatch.setattr("oswald_globe.globe_widget.glLineWidth", lambda *args, **kwargs: None)
+        monkeypatch.setattr("oswald_globe.globe_widget.glDepthMask", lambda *args, **kwargs: None)
+        monkeypatch.setattr("oswald_globe.globe_widget.glDrawArrays", lambda *args, **kwargs: None)
+
+        widget._draw_brush_overlay(np.eye(4, dtype=np.float32), np.eye(4, dtype=np.float32))
+
+        assert ring_calls == [pytest.approx(widget.paint_angular_radius)]
+    finally:
+        window.close()
+
+
+def test_select_tool_mouse_down_replaces_existing_selection_without_shift(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        widget = window.viewer.gl_widget
+        widget.set_tool_mode("select")
+        widget.set_undo_stack(UndoStack())
+        widget.set_brush_command_factory(window._create_select_command)
+
+        selection = widget.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+        selection.values[:] = 1.0
+
+        monkeypatch.setattr(
+            "oswald_globe.globe_widget.unproject_point",
+            lambda *args, **kwargs: {
+                "target_lat": 0.5,
+                "target_lon": -1.0,
+                "value": 0.0,
+                "lat_deg": 0.0,
+                "lon_deg": 0.0,
+            },
+        )
+
+        class SelectPressEvent:
+            def __init__(self, x: float, y: float):
+                self._pos = QPointF(x, y)
+
+            def button(self):
+                return Qt.MouseButton.LeftButton
+
+            def position(self):
+                return self._pos
+
+            def modifiers(self):
+                return Qt.KeyboardModifier.NoModifier
+
+        widget.mousePressEvent(SelectPressEvent(12.0, 34.0))
+
+        assert np.any(selection.values == 0.0)
+        assert np.max(selection.values) == pytest.approx(1.0)
+    finally:
+        window.close()
+
+
+def test_select_tool_mouse_down_with_shift_adds_to_existing_selection(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        widget = window.viewer.gl_widget
+        widget.set_tool_mode("select")
+        widget.set_undo_stack(UndoStack())
+        widget.set_brush_command_factory(window._create_select_command)
+
+        selection = widget.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+        selection.values[:] = 0.0
+        lat_deg, lon_deg = widget.mesh_grid.vertex_lat_lon()
+        target_index = 0
+        center = widget.mesh_grid.vertices[target_index]
+        distances = np.arccos(np.clip(widget.mesh_grid.vertices @ center, -1.0, 1.0))
+        far_index = int(np.argmax(distances))
+        selection.values[far_index] = 0.5
+
+        monkeypatch.setattr(
+            "oswald_globe.globe_widget.unproject_point",
+            lambda *args, **kwargs: {
+                "target_lat": np.deg2rad(float(lat_deg[target_index])),
+                "target_lon": np.deg2rad(float(lon_deg[target_index])),
+                "value": 0.0,
+                "lat_deg": float(lat_deg[target_index]),
+                "lon_deg": float(lon_deg[target_index]),
+            },
+        )
+
+        class SelectShiftPressEvent:
+            def __init__(self, x: float, y: float):
+                self._pos = QPointF(x, y)
+
+            def button(self):
+                return Qt.MouseButton.LeftButton
+
+            def position(self):
+                return self._pos
+
+            def modifiers(self):
+                return Qt.KeyboardModifier.ShiftModifier
+
+        widget.mousePressEvent(SelectShiftPressEvent(12.0, 34.0))
+
+        assert selection.values[far_index] == pytest.approx(0.5)
+        assert np.max(selection.values) == pytest.approx(1.0)
+    finally:
+        window.close()
+
+
+def test_select_tool_mouse_down_with_alt_erases_without_clearing_other_selection(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        widget = window.viewer.gl_widget
+        widget.set_tool_mode("select")
+        widget.set_undo_stack(UndoStack())
+        widget.set_brush_command_factory(window._create_select_command)
+
+        selection = widget.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+        selection.values[:] = 1.0
+        lat_deg, lon_deg = widget.mesh_grid.vertex_lat_lon()
+        target_index = 0
+        center = widget.mesh_grid.vertices[target_index]
+        distances = np.arccos(np.clip(widget.mesh_grid.vertices @ center, -1.0, 1.0))
+        far_index = int(np.argmax(distances))
+
+        monkeypatch.setattr(
+            "oswald_globe.globe_widget.unproject_point",
+            lambda *args, **kwargs: {
+                "target_lat": np.deg2rad(float(lat_deg[target_index])),
+                "target_lon": np.deg2rad(float(lon_deg[target_index])),
+                "value": 0.0,
+                "lat_deg": float(lat_deg[target_index]),
+                "lon_deg": float(lon_deg[target_index]),
+            },
+        )
+
+        class SelectAltPressEvent:
+            def __init__(self, x: float, y: float):
+                self._pos = QPointF(x, y)
+
+            def button(self):
+                return Qt.MouseButton.LeftButton
+
+            def position(self):
+                return self._pos
+
+            def modifiers(self):
+                return Qt.KeyboardModifier.AltModifier
+
+        widget.mousePressEvent(SelectAltPressEvent(12.0, 34.0))
+
+        assert np.any(selection.values == 0.0)
+        assert selection.values[far_index] == pytest.approx(1.0)
+    finally:
+        window.close()
+
+
+def test_select_tool_alt_drag_erases_selection_under_outer_circle(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        widget = window.viewer.gl_widget
+        widget.set_tool_mode("select")
+        widget.set_undo_stack(UndoStack())
+        widget.set_brush_command_factory(window._create_select_command)
+
+        selection = widget.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+        selection.values[:] = 1.0
+
+        monkeypatch.setattr(
+            "oswald_globe.globe_widget.unproject_point",
+            lambda *args, **kwargs: {
+                "target_lat": 0.5,
+                "target_lon": -1.0,
+                "value": 0.0,
+                "lat_deg": 0.0,
+                "lon_deg": 0.0,
+            },
+        )
+
+        class SelectAltDragEvent:
+            def __init__(self, x: float, y: float):
+                self._pos = QPointF(x, y)
+
+            def buttons(self):
+                return Qt.MouseButton.LeftButton
+
+            def position(self):
+                return self._pos
+
+            def modifiers(self):
+                return Qt.KeyboardModifier.AltModifier
+
+        widget.mouseMoveEvent(SelectAltDragEvent(12.0, 34.0))
+
+        assert np.any(selection.values == 0.0)
+    finally:
+        window.close()
+
+
+def test_select_menu_actions_update_selection_and_support_undo(qapp):
+    window = create_window()
+    try:
+        selection = window.viewer.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+        selection.values[:] = np.linspace(0.0, 1.0, selection.values.size, dtype=np.float64)
+        original = selection.values.copy()
+
+        window.select_all_vertices()
+        np.testing.assert_allclose(selection.values, 1.0)
+
+        window._undo_stack.undo()
+        np.testing.assert_allclose(selection.values, original)
+
+        window.select_no_vertices()
+        np.testing.assert_allclose(selection.values, 0.0)
+
+        window._undo_stack.undo()
+        np.testing.assert_allclose(selection.values, original)
+
+        window.invert_vertex_selection()
+        np.testing.assert_allclose(selection.values, 1.0 - original)
+
+        window._undo_stack.undo()
+        np.testing.assert_allclose(selection.values, original)
+    finally:
+        window.close()
+
+
+def test_auto_spin_blocks_globe_mouse_interactions(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        widget = window.viewer.gl_widget
+        widget.anim_timer.stop()
+        widget.is_auto_spin = True
+
+        monkeypatch.setattr(
+            "oswald_globe.globe_widget.unproject_point",
+            lambda *args, **kwargs: {
+                "target_lat": 0.5,
+                "target_lon": -1.0,
+                "value": 0.0,
+                "lat_deg": 0.0,
+                "lon_deg": 0.0,
+            },
+        )
+
+        class HoverEvent:
+            def __init__(self, x: float, y: float):
+                self._pos = QPointF(x, y)
+
+            def buttons(self):
+                return Qt.MouseButton.NoButton
+
+            def position(self):
+                return self._pos
+
+        class PressEvent(HoverEvent):
+            def button(self):
+                return Qt.MouseButton.LeftButton
+
+        class WheelDelta:
+            def y(self):
+                return 120
+
+        class WheelEvent(HoverEvent):
+            def angleDelta(self):
+                return WheelDelta()
+
+        start_lon = widget.center_lon
+        start_lat = widget.center_lat
+        start_zoom = widget.zoom
+
+        widget.mouseMoveEvent(HoverEvent(12.0, 34.0))
+        assert widget.cursor().shape() == Qt.CursorShape.ForbiddenCursor
+
+        widget.mousePressEvent(PressEvent(12.0, 34.0))
+        assert widget.is_dragging is False
+
+        widget.mouseMoveEvent(PressEvent(22.0, 44.0))
+        widget.mouseReleaseEvent(PressEvent(22.0, 44.0))
+        widget.mouseDoubleClickEvent(PressEvent(22.0, 44.0))
+        widget.wheelEvent(WheelEvent(22.0, 44.0))
+
+        assert widget.cursor().shape() == Qt.CursorShape.ForbiddenCursor
+        assert widget.center_lon == pytest.approx(start_lon)
+        assert widget.center_lat == pytest.approx(start_lat)
+        assert widget.zoom == pytest.approx(start_zoom)
+    finally:
+        window.close()
+
+
+def test_auto_spin_hides_brush_overlay(qapp):
+    window = create_window()
+    try:
+        widget = window.viewer.gl_widget
+        widget.set_tool_mode("paint")
+        widget.is_auto_spin = True
+        widget._mouse_over_globe = True
+        widget.paint_angular_radius = 1.0
+        widget.line_program = 1
+        widget.brush_vertex_count = 99
+
+        widget._draw_brush_overlay(np.eye(4, dtype=np.float32), np.eye(4, dtype=np.float32))
+
+        assert widget.brush_vertex_count == 99
+    finally:
+        window.close()
+
+
 def test_open_heightfield_dialog_configuration(qapp):
     window = create_window()
 
@@ -904,6 +1571,12 @@ def test_project_round_trip_preserves_mesh_geometry_layers_and_metadata(tmp_path
         legend="grayscale",
         z_index=3,
     )
+    grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values[:] = np.linspace(
+        0.0,
+        1.0,
+        grid.vertex_count(),
+        dtype=np.float64,
+    )
     metadata = {"legend_source": ":/legends/grayscale.txt", "author": "tests"}
     project_path = tmp_path / "round_trip.ogp"
 
@@ -917,6 +1590,10 @@ def test_project_round_trip_preserves_mesh_geometry_layers_and_metadata(tmp_path
     np.testing.assert_allclose(
         loaded.grid.get_layer("elevation").values,
         grid.get_layer("elevation").values,
+    )
+    np.testing.assert_allclose(
+        loaded.grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values,
+        grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values,
     )
     loaded_temperature = loaded.grid.get_layer("temperature")
     original_temperature = grid.get_layer("temperature")

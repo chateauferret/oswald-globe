@@ -28,6 +28,23 @@ source "$VENV_DIR/bin/activate"
 mkdir -p "$LOG_DIR"
 printf '\n[%s] Starting Oswald Globe\n' "$(date --iso-8601=seconds)" >> "$LOG_FILE"
 
+export QT_OPENGL="${QT_OPENGL:-desktop}"
+if [[ "${OSTYPE:-}" == linux* ]]; then
+    export QT_XCB_GL_INTEGRATION="${QT_XCB_GL_INTEGRATION:-xcb_glx}"
+    if [[ -z "${__EGL_VENDOR_LIBRARY_FILENAMES:-}" ]]; then
+        for vendor_json in \
+            /usr/share/glvnd/egl_vendor.d/*nvidia*.json \
+            /usr/local/share/glvnd/egl_vendor.d/*nvidia*.json \
+            /etc/glvnd/egl_vendor.d/*nvidia*.json
+        do
+            if [[ -f "$vendor_json" ]]; then
+                export __EGL_VENDOR_LIBRARY_FILENAMES="$vendor_json"
+                break
+            fi
+        done
+    fi
+fi
+
 # Keep a complete copy of startup output when terminal scrollback is limited.
 set +e
 PYTHONUNBUFFERED=1 python "$PROJECT_ROOT/app.py" "$@" 2>&1 | tee -a "$LOG_FILE"

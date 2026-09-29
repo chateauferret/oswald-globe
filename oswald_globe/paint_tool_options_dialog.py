@@ -57,13 +57,16 @@ class PaintToolOptionsDialog(QDialog):
         self,
         parent: Optional[QWidget] = None,
         *,
+        title: str = "Paint Tool Options",
         value: int = 0,
         mode: str = "Replace",
         radius_km: int = 100,
         falloff_percent: int = 50,
+        include_value: bool = True,
+        include_mode: bool = True,
     ):
         super().__init__(parent)
-        self.setWindowTitle("Paint Tool Options")
+        self.setWindowTitle(title)
         self.setWindowFlag(Qt.WindowType.Tool, True)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self.setModal(False)
@@ -92,14 +95,27 @@ class PaintToolOptionsDialog(QDialog):
         self.falloff_slider.setValue(int(falloff_percent))
         self.falloff_spin = self._SliderBoundSpinBox(self.falloff_slider, self)
 
-        layout.addWidget(QLabel("Value"), 0, 0)
-        layout.addWidget(self.value_slider, 0, 1)
-        layout.addWidget(self.value_spin, 0, 2)
-        layout.addWidget(QLabel("Mode"), 1, 0)
-        layout.addWidget(self.mode_combo, 1, 1, 1, 2)
-        layout.addWidget(QLabel("Radius (km)"), 2, 0)
-        layout.addWidget(self.radius_slider, 2, 1)
-        layout.addWidget(self.radius_spin, 2, 2)
-        layout.addWidget(QLabel("Falloff (%)"), 3, 0)
-        layout.addWidget(self.falloff_slider, 3, 1)
-        layout.addWidget(self.falloff_spin, 3, 2)
+        row = 0
+        if include_value:
+            layout.addWidget(QLabel("Value"), row, 0)
+            layout.addWidget(self.value_slider, row, 1)
+            layout.addWidget(self.value_spin, row, 2)
+            row += 1
+        else:
+            self.value_slider.hide()
+            self.value_spin.hide()
+
+        if include_mode:
+            layout.addWidget(QLabel("Mode"), row, 0)
+            layout.addWidget(self.mode_combo, row, 1, 1, 2)
+            row += 1
+        else:
+            self.mode_combo.hide()
+
+        layout.addWidget(QLabel("Radius (km)"), row, 0)
+        layout.addWidget(self.radius_slider, row, 1)
+        layout.addWidget(self.radius_spin, row, 2)
+        row += 1
+        layout.addWidget(QLabel("Falloff (%)"), row, 0)
+        layout.addWidget(self.falloff_slider, row, 1)
+        layout.addWidget(self.falloff_spin, row, 2)

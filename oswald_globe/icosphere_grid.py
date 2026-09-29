@@ -89,10 +89,18 @@ class _Face:
 class IcosphereGrid:
     """Adaptive geodesic-sphere mesh for holding global terrain data."""
 
+    SELECTION_LAYER_NAME = "selection_status"
+
     def __init__(self):
         self._vertices: List[np.ndarray] = [v.copy() for v in _BASE_VERTICES]
         self._layers: "OrderedDict[str, Layer]" = OrderedDict()
         self._ensure_layer("elevation", values=np.full(len(self._vertices), np.nan, dtype=np.float64))
+        self._ensure_layer(
+            self.SELECTION_LAYER_NAME,
+            values=np.zeros(len(self._vertices), dtype=np.float64),
+            description="Soft vertex selection mask",
+            visible=False,
+        )
         self._edge_midpoints: Dict[Tuple[int, int], int] = {}
         self.roots: List[_Face] = [_Face(f, 0) for f in _BASE_FACES]
 
@@ -101,6 +109,7 @@ class IcosphereGrid:
         self._conforming_cache: Optional[List[_Face]] = None
         self._kdtree: Optional[cKDTree] = None
         self._kdtree_faces: Optional[List[_Face]] = None
+        self._dual_cell_segments_cache: Optional[Tuple[np.ndarray, np.ndarray]] = None
         
 
     def layer_names(self) -> List[str]:
@@ -172,7 +181,11 @@ class IcosphereGrid:
             return layer
 
         if values is None:
-            values = np.full(len(self._vertices), np.nan, dtype=np.float64)
+            values = np.full(
+                len(self._vertices),
+                self._default_layer_fill_value(name),
+                dtype=np.float64,
+            )
         arr = np.asarray(values, dtype=np.float64)
         if arr.shape[0] != len(self._vertices):
             raise ValueError(f"Layer {name!r} must contain one value per vertex ({len(self._vertices)}), got shape {arr.shape}.")
@@ -195,12 +208,20 @@ class IcosphereGrid:
 
         layer = self._layers[name]
         if layer.values.shape[0] != len(self._vertices):
-            padded = np.full(len(self._vertices), np.nan, dtype=np.float64)
+            padded = np.full(
+                len(self._vertices),
+                self._default_layer_fill_value(name),
+                dtype=np.float64,
+            )
             copy_count = min(layer.values.shape[0], len(self._vertices))
             if copy_count:
                 padded[:copy_count] = layer.values[:copy_count]
             layer.values = padded
         return layer
+
+    @classmethod
+    def _default_layer_fill_value(cls, name: str) -> float:
+        return 0.0 if str(name) == cls.SELECTION_LAYER_NAME else np.nan
 
     def get_layer(self, name: str) -> Layer:
         """Return the named layer object."""
@@ -209,6 +230,11 @@ class IcosphereGrid:
     def set_layer(self, name: str, values: np.ndarray, **kwargs: Any) -> Layer:
         """Set a named data layer for all vertices."""
         return self.add_layer(name, values, **kwargs)
+
+    @property
+    def has_selection(self) -> bool:
+        selection = self.get_layer(self.SELECTION_LAYER_NAME).values
+        return bool(np.any(selection > 0.0))
 
     @property
     def _values(self) -> np.ndarray:
@@ -225,13 +251,14 @@ class IcosphereGrid:
         self._conforming_cache = None
         self._kdtree = None
         self._kdtree_faces = None
+        self._dual_cell_segments_cache = None
 
     def _add_vertex(self, xyz: np.ndarray) -> int:
         idx = len(self._vertices)
         self._vertices.append(xyz)
         for layer_name in self.layer_names():
             layer = self._layers[layer_name]
-            layer.values = np.append(layer.values, np.nan)
+            layer.values = np.append(layer.values, self._default_layer_fill_value(layer_name))
         return idx
 
     @staticmethod
@@ -401,6 +428,58 @@ class IcosphereGrid:
                 else:
                     edges.append((other, i))
         return np.array(edges, dtype=np.uint32).reshape(-1, 2)
+
+    def dual_cell_line_segments(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return Voronoi cell line segments and per-vertex draw ranges."""
+        if self._dual_cell_segments_cache is not None:
+            return self._dual_cell_segments_cache
+
+        faces = self.leaf_faces()
+        centroids = self.dual_vertices()
+        incident_faces: List[List[int]] = [[] for _ in range(self.vertex_count())]
+        for face_index, face in enumerate(faces):
+            for vertex_index in face.v:
+                incident_faces[vertex_index].append(face_index)
+
+        segment_groups: List[np.ndarray] = []
+        ranges = np.zeros((self.vertex_count(), 2), dtype=np.int32)
+        vertices = self.vertices
+        offset = 0
+
+        for vertex_index, face_indices in enumerate(incident_faces):
+            if len(face_indices) < 3:
+                ranges[vertex_index] = (offset, 0)
+                continue
+
+            center = vertices[vertex_index]
+            reference_axis = (
+                np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                if abs(center[2]) < 0.9
+                else np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            )
+            tangent_x = np.cross(reference_axis, center)
+            tangent_x /= np.linalg.norm(tangent_x)
+            tangent_y = np.cross(center, tangent_x)
+
+            cell_centroids = centroids[np.asarray(face_indices, dtype=np.intp)]
+            projected = cell_centroids - (cell_centroids @ center)[:, None] * center[None, :]
+            angles = np.arctan2(projected @ tangent_y, projected @ tangent_x)
+            ordered = cell_centroids[np.argsort(angles)]
+
+            pairs = np.empty((len(ordered) * 2, 3), dtype=np.float64)
+            pairs[0::2] = ordered
+            pairs[1::2] = np.roll(ordered, -1, axis=0)
+            segment_groups.append(pairs)
+            ranges[vertex_index] = (offset, len(pairs))
+            offset += len(pairs)
+
+        if segment_groups:
+            segments = np.concatenate(segment_groups, axis=0)
+        else:
+            segments = np.empty((0, 3), dtype=np.float64)
+
+        self._dual_cell_segments_cache = (segments, ranges)
+        return self._dual_cell_segments_cache
 
     def _ensure_values(self, indices, value_fn):
         missing = [i for i in indices if np.isnan(self._values[i])]
@@ -800,6 +879,19 @@ class IcosphereGrid:
 
         if "elevation" not in grid._layers:
             raise ValueError("Serialized icosphere grid must include an 'elevation' layer.")
+        if cls.SELECTION_LAYER_NAME not in grid._layers:
+            grid.add_layer(
+                cls.SELECTION_LAYER_NAME,
+                np.zeros(len(grid._vertices), dtype=np.float64),
+                description="Soft vertex selection mask",
+                visible=False,
+            )
+        selection_layer = grid.get_layer(cls.SELECTION_LAYER_NAME)
+        selection_layer.values = np.clip(
+            np.nan_to_num(selection_layer.values, nan=0.0),
+            0.0,
+            1.0,
+        )
 
         edge_midpoint_keys = np.asarray(
             state.get("edge_midpoint_keys", np.empty((0, 2), dtype=np.int64)),
