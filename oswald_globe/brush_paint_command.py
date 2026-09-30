@@ -1,8 +1,9 @@
-"""Brush paint command with undo/redo support."""
+"""Brush-based mesh edit commands with undo/redo support."""
 
 from __future__ import annotations
 
 import math
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -12,23 +13,34 @@ from oswald_globe.icosphere_grid import IcosphereGrid
 
 
 @dataclass(slots=True)
-class BrushPaintCommand:
-    """Paint a brush stroke onto the mesh-backed elevation layer."""
+class BrushCommand(ABC):
+    """Common base for undoable commands that paint a lat/lon brush stroke
+    onto a mesh-backed layer.
+
+    Subclasses implement `_capture_values` to compute the affected vertex
+    indices and their before/after values, and `_apply` to write a set of
+    values back onto their target layer.
+    """
 
     target_lat_deg: float
     target_lon_deg: float
     radius_km: float
     falloff_percent: float
-    paint_value: int
-    paint_mode: str
     mesh_grid: IcosphereGrid
-    apply_vertex_values: Callable[[np.ndarray, np.ndarray], None]
     vertex_indices: np.ndarray = field(init=False, repr=False)
     before_values: np.ndarray = field(init=False, repr=False)
     after_values: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.vertex_indices, self.before_values, self.after_values = self._capture_brush_values()
+        self.vertex_indices, self.before_values, self.after_values = self._capture_values()
+
+    @abstractmethod
+    def _capture_values(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _apply(self, indices: np.ndarray, values: np.ndarray) -> None:
+        raise NotImplementedError
 
     @staticmethod
     def _brush_radii(radius_km: float, falloff_percent: float) -> tuple[float, float]:
@@ -46,6 +58,43 @@ class BrushPaintCommand:
             [cos_lat * math.cos(lon_rad), cos_lat * math.sin(lon_rad), math.sin(lat_rad)],
             dtype=np.float64,
         )
+
+    @classmethod
+    def _capture_vertex_distances(
+        cls,
+        mesh_grid: IcosphereGrid,
+        target_lat_deg: float,
+        target_lon_deg: float,
+        radius_km: float,
+        falloff_percent: float,
+    ) -> tuple[float, float, np.ndarray, np.ndarray]:
+        inner_radius, outer_radius = cls._brush_radii(radius_km, falloff_percent)
+        center_xyz = cls._latlon_to_xyz(target_lat_deg, target_lon_deg)
+        angular_distances = np.arccos(np.clip(mesh_grid.vertices @ center_xyz, -1.0, 1.0))
+        vertex_indices = np.flatnonzero(angular_distances <= outer_radius + 1e-9)
+        return inner_radius, outer_radius, angular_distances, vertex_indices
+
+    def redo(self) -> None:
+        if self.vertex_indices.size == 0:
+            return
+        self._apply(self.vertex_indices, self.after_values)
+
+    def undo(self) -> None:
+        if self.vertex_indices.size == 0:
+            return
+        self._apply(self.vertex_indices, self.before_values)
+
+
+@dataclass(slots=True)
+class BrushPaintCommand(BrushCommand):
+    """Paint a brush stroke onto the mesh-backed elevation layer."""
+
+    paint_value: int
+    paint_mode: str
+    apply_vertex_values: Callable[[np.ndarray, np.ndarray], None]
+
+    def _apply(self, indices: np.ndarray, values: np.ndarray) -> None:
+        self.apply_vertex_values(indices, values)
 
     @staticmethod
     def _apply_paint_mode(existing_values: np.ndarray, paint_value: float, paint_mode: str) -> np.ndarray:
@@ -66,22 +115,7 @@ class BrushPaintCommand:
             return (existing_values + paint_value) / 2.0
         raise ValueError(f"Unsupported paint mode: {paint_mode!r}")
 
-    @classmethod
-    def _capture_vertex_distances(
-        cls,
-        mesh_grid: IcosphereGrid,
-        target_lat_deg: float,
-        target_lon_deg: float,
-        radius_km: float,
-        falloff_percent: float,
-    ) -> tuple[float, float, np.ndarray, np.ndarray]:
-        inner_radius, outer_radius = cls._brush_radii(radius_km, falloff_percent)
-        center_xyz = cls._latlon_to_xyz(target_lat_deg, target_lon_deg)
-        angular_distances = np.arccos(np.clip(mesh_grid.vertices @ center_xyz, -1.0, 1.0))
-        vertex_indices = np.flatnonzero(angular_distances <= outer_radius + 1e-9)
-        return inner_radius, outer_radius, angular_distances, vertex_indices
-
-    def _capture_brush_values(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _capture_values(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         inner_radius, outer_radius, angular_distances, vertex_indices = self._capture_vertex_distances(
             self.mesh_grid,
             self.target_lat_deg,
@@ -120,38 +154,20 @@ class BrushPaintCommand:
         after_values = before_values + selection_values * (brush_values - before_values)
         return vertex_indices, before_values, after_values
 
-    def redo(self) -> None:
-        if self.vertex_indices.size == 0:
-            return
-        self.apply_vertex_values(self.vertex_indices, self.after_values)
-
-    def undo(self) -> None:
-        if self.vertex_indices.size == 0:
-            return
-        self.apply_vertex_values(self.vertex_indices, self.before_values)
-
 
 @dataclass(slots=True)
-class SelectionBrushCommand:
+class SelectionBrushCommand(BrushCommand):
     """Paint a soft-selection mask onto the mesh-backed selection layer."""
 
-    target_lat_deg: float
-    target_lon_deg: float
-    radius_km: float
-    falloff_percent: float
     replace_existing: bool
     erase_selection: bool
-    mesh_grid: IcosphereGrid
     apply_selection_values: Callable[[np.ndarray, np.ndarray], None]
-    vertex_indices: np.ndarray = field(init=False, repr=False)
-    before_values: np.ndarray = field(init=False, repr=False)
-    after_values: np.ndarray = field(init=False, repr=False)
 
-    def __post_init__(self) -> None:
-        self.vertex_indices, self.before_values, self.after_values = self._capture_selection_values()
+    def _apply(self, indices: np.ndarray, values: np.ndarray) -> None:
+        self.apply_selection_values(indices, values)
 
-    def _capture_selection_values(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        inner_radius, outer_radius, angular_distances, vertex_indices = BrushPaintCommand._capture_vertex_distances(
+    def _capture_values(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        inner_radius, outer_radius, angular_distances, vertex_indices = self._capture_vertex_distances(
             self.mesh_grid,
             self.target_lat_deg,
             self.target_lon_deg,
@@ -194,16 +210,6 @@ class SelectionBrushCommand:
         else:
             after_values = np.maximum(before_values, weights)
         return vertex_indices, before_values, after_values
-
-    def redo(self) -> None:
-        if self.vertex_indices.size == 0:
-            return
-        self.apply_selection_values(self.vertex_indices, self.after_values)
-
-    def undo(self) -> None:
-        if self.vertex_indices.size == 0:
-            return
-        self.apply_selection_values(self.vertex_indices, self.before_values)
 
 
 @dataclass(slots=True)
