@@ -1,4 +1,4 @@
-"""Base tool abstractions for the globe application."""
+"""Base tool abstractions and the default navigation tool."""
 
 from __future__ import annotations
 
@@ -77,20 +77,15 @@ class NavigateTool(Tool):
 
 
 class BrushTool(Tool):
-    """Common base for tools that manipulate a radius/falloff brush.
-
-    Subclasses provide the menu label (`_menu_label`) and the options
-    dialog (`create_options_dialog`), and typically override
-    `dispose_options_dialog` to persist any additional fields before
-    calling `super().dispose_options_dialog()`.
-    """
+    """Common base for tools that manipulate a radius/falloff brush."""
 
     _menu_label: str = ""
 
-    def __init__(self, parent: QWidget):
+    def __init__(self, parent: QWidget, on_brush_changed: Callable[[], None]):
         super().__init__(parent)
         self._radius_km = 100
         self._falloff_percent = 50
+        self._on_brush_changed = on_brush_changed
 
     def create_menu_action(
         self,
@@ -108,9 +103,7 @@ class BrushTool(Tool):
 
     @Slot(int)
     def _notify_brush_changed(self, _value: int) -> None:
-        sync = getattr(self._parent, "_sync_tool_mode_to_viewer", None)
-        if callable(sync):
-            sync()
+        self._on_brush_changed()
 
     def dispose_options_dialog(self) -> None:
         if self._options_dialog is not None:

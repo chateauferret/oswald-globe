@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QAbstractSpinBox, QComboBox, QDialog, QGridLayout, QLabel, QSlider, QSpinBox, QWidget
 
 
-class PaintToolOptionsDialog(QDialog):
+class ToolOptionsDialog(QDialog):
     _PAINT_MODES = ("Replace", "Add", "Subtract", "Minimum", "Maximum", "Multiply", "Average")
 
     class _SliderBoundSpinBox(QSpinBox):

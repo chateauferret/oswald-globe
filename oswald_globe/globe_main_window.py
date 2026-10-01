@@ -45,11 +45,9 @@ try:
     from .icosphere_grid import IcosphereGrid
     from .icosphere_build_worker import IcosphereBuildWorker
     from .icosphere_progress_dialog import IcosphereProgressDialog
-    from .paint_tool import PaintTool
-    from .select_tool import SelectTool
+    from .tools import BrushTool, NavigateTool, PaintTool, SelectTool, Tool
     from .project import Project
     from .settings_dialog import SettingsDialog
-    from .tool import NavigateTool, Tool
     from .undo_stack import BrushPaintCommand, SelectionBrushCommand, SelectionLayerCommand, UndoStack
 except ImportError:  # pragma: no cover - supports running as a script
     from oswald_globe import resources_rc  # noqa: F401
@@ -59,11 +57,9 @@ except ImportError:  # pragma: no cover - supports running as a script
     from oswald_globe.icosphere_grid import IcosphereGrid
     from oswald_globe.icosphere_build_worker import IcosphereBuildWorker
     from oswald_globe.icosphere_progress_dialog import IcosphereProgressDialog
-    from oswald_globe.paint_tool import PaintTool
-    from oswald_globe.select_tool import SelectTool
+    from oswald_globe.tools import BrushTool, NavigateTool, PaintTool, SelectTool, Tool
     from oswald_globe.project import Project
     from oswald_globe.settings_dialog import SettingsDialog
-    from oswald_globe.tool import NavigateTool, Tool
     from oswald_globe.undo_stack import BrushPaintCommand, SelectionBrushCommand, SelectionLayerCommand, UndoStack
 
 
@@ -402,8 +398,8 @@ class GlobeMainWindow(QMainWindow):
         self._undo_stack = UndoStack(on_changed=self._on_project_state_changed)
         self._tools: Dict[str, Tool] = {
             "navigate": NavigateTool(self),
-            "select": SelectTool(self),
-            "paint": PaintTool(self),
+            "select": SelectTool(self, self._sync_tool_mode_to_viewer),
+            "paint": PaintTool(self, self._sync_tool_mode_to_viewer),
         }
         self._active_tool: Optional[Tool] = None
         self._active_tool_name: Optional[str] = None
@@ -558,7 +554,7 @@ class GlobeMainWindow(QMainWindow):
             return
         gl_widget.set_tool_mode(self._active_tool_name or "navigate")
         brush_tool = self._tools.get(self._active_tool_name or "")
-        if isinstance(brush_tool, (PaintTool, SelectTool)):
+        if isinstance(brush_tool, BrushTool):
             gl_widget.set_paint_brush(brush_tool.radius_km(), brush_tool.falloff_percent())
         paint_tool = self._tools.get("paint")
         if self._active_tool_name == "paint":
