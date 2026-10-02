@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from PySide6.QtCore import Slot
 from PySide6.QtGui import QAction, QActionGroup
@@ -58,6 +59,16 @@ class Tool(ABC):
         self._options_dialog = None
         dialog.close()
         dialog.deleteLater()
+
+    def apply_interaction(
+        self,
+        gl_widget: Any,
+        pt: Optional[Dict[str, Any]],
+        *,
+        replace_existing: bool = False,
+        erase_selection: bool = False,
+    ) -> None:
+        return None
 
 
 class NavigateTool(Tool):
@@ -120,3 +131,39 @@ class BrushTool(Tool):
         if self._options_dialog is not None:
             return int(self._options_dialog.falloff_slider.value())
         return self._falloff_percent
+
+    def create_brush_command(self, payload: Dict[str, Any], gl_widget: Any):
+        raise NotImplementedError
+
+    def apply_interaction(
+        self,
+        gl_widget: Any,
+        pt: Optional[Dict[str, Any]],
+        *,
+        replace_existing: bool = False,
+        erase_selection: bool = False,
+    ) -> None:
+        if pt is None:
+            gl_widget._mouse_over_globe = False
+            gl_widget._refresh_cursor()
+            return
+
+        gl_widget._mouse_over_globe = True
+        gl_widget._hover_target_lat = pt["target_lat"]
+        gl_widget._hover_target_lon = pt["target_lon"]
+
+        if gl_widget._undo_stack is None:
+            raise RuntimeError("Brush command handling has not been configured.")
+
+        payload = {
+            "target_lat_deg": math.degrees(pt["target_lat"]),
+            "target_lon_deg": math.degrees(pt["target_lon"]),
+            "radius_km": float(self.radius_km()),
+            "falloff_percent": float(self.falloff_percent()),
+        }
+        if replace_existing:
+            payload["replace_existing"] = True
+        if erase_selection:
+            payload["erase_selection"] = True
+
+        gl_widget._undo_stack.push(self.create_brush_command(payload, gl_widget))

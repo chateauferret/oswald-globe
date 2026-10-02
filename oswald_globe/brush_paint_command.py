@@ -85,158 +85,20 @@ class BrushCommand(ABC):
         self._apply(self.vertex_indices, self.before_values)
 
 
-@dataclass(slots=True)
-class BrushPaintCommand(BrushCommand):
-    """Paint a brush stroke onto the mesh-backed elevation layer."""
+def __getattr__(name: str):
+    if name == "BrushPaintCommand":
+        from oswald_globe.tools.paint_tool import BrushPaintCommand
 
-    paint_value: int
-    paint_mode: str
-    apply_vertex_values: Callable[[np.ndarray, np.ndarray], None]
+        return BrushPaintCommand
+    if name == "SelectionBrushCommand":
+        from oswald_globe.tools.select_tool import SelectionBrushCommand
 
-    def _apply(self, indices: np.ndarray, values: np.ndarray) -> None:
-        self.apply_vertex_values(indices, values)
+        return SelectionBrushCommand
+    if name == "SelectionLayerCommand":
+        from oswald_globe.tools.select_tool import SelectionLayerCommand
 
-    @staticmethod
-    def _apply_paint_mode(existing_values: np.ndarray, paint_value: float, paint_mode: str) -> np.ndarray:
-        mode = str(paint_mode)
-        if mode == "Replace":
-            return np.full(existing_values.shape, paint_value, dtype=np.float64)
-        if mode == "Add":
-            return existing_values + paint_value
-        if mode == "Subtract":
-            return existing_values - paint_value
-        if mode == "Minimum":
-            return np.minimum(existing_values, paint_value)
-        if mode == "Maximum":
-            return np.maximum(existing_values, paint_value)
-        if mode == "Multiply":
-            return existing_values * paint_value
-        if mode == "Average":
-            return (existing_values + paint_value) / 2.0
-        raise ValueError(f"Unsupported paint mode: {paint_mode!r}")
-
-    def _capture_values(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        inner_radius, outer_radius, angular_distances, vertex_indices = self._capture_vertex_distances(
-            self.mesh_grid,
-            self.target_lat_deg,
-            self.target_lon_deg,
-            self.radius_km,
-            self.falloff_percent,
-        )
-
-        layer = self.mesh_grid.get_layer("elevation")
-        before_values = layer.values[vertex_indices].astype(np.float64, copy=True)
-        after_values = before_values.copy()
-        if vertex_indices.size == 0:
-            return vertex_indices, before_values, after_values
-
-        paint_value = float(self.paint_value)
-        operated_values = self._apply_paint_mode(before_values, paint_value, self.paint_mode)
-        brush_values = before_values.copy()
-        if inner_radius >= outer_radius - 1e-12:
-            brush_values = operated_values
-        else:
-            affected_distances = angular_distances[vertex_indices]
-            inner_mask = affected_distances <= inner_radius + 1e-12
-            brush_values[inner_mask] = operated_values[inner_mask]
-
-            transition_mask = ~inner_mask
-            if np.any(transition_mask):
-                blend = (affected_distances[transition_mask] - inner_radius) / (outer_radius - inner_radius)
-                brush_values[transition_mask] = (
-                    (1.0 - blend) * operated_values[transition_mask] + blend * before_values[transition_mask]
-                )
-
-        if not self.mesh_grid.has_selection:
-            return vertex_indices, before_values, brush_values
-
-        selection_values = self.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values[vertex_indices]
-        after_values = before_values + selection_values * (brush_values - before_values)
-        return vertex_indices, before_values, after_values
+        return SelectionLayerCommand
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-@dataclass(slots=True)
-class SelectionBrushCommand(BrushCommand):
-    """Paint a soft-selection mask onto the mesh-backed selection layer."""
-
-    replace_existing: bool
-    erase_selection: bool
-    apply_selection_values: Callable[[np.ndarray, np.ndarray], None]
-
-    def _apply(self, indices: np.ndarray, values: np.ndarray) -> None:
-        self.apply_selection_values(indices, values)
-
-    def _capture_values(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        inner_radius, outer_radius, angular_distances, vertex_indices = self._capture_vertex_distances(
-            self.mesh_grid,
-            self.target_lat_deg,
-            self.target_lon_deg,
-            self.radius_km,
-            self.falloff_percent,
-        )
-
-        layer = self.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-        source_values = layer.values.astype(np.float64, copy=True)
-        if self.replace_existing:
-            before_values = source_values
-            after_values = np.zeros_like(before_values)
-        else:
-            before_values = source_values[vertex_indices].copy()
-            after_values = before_values.copy()
-        if vertex_indices.size == 0:
-            if self.replace_existing:
-                return np.arange(self.mesh_grid.vertex_count(), dtype=np.intp), before_values, after_values
-            return vertex_indices, before_values, after_values
-
-        if self.erase_selection:
-            weights = np.zeros(vertex_indices.shape, dtype=np.float64)
-        else:
-            affected_distances = angular_distances[vertex_indices]
-            if inner_radius >= outer_radius - 1e-12:
-                weights = np.ones(vertex_indices.shape, dtype=np.float64)
-            else:
-                weights = np.clip(
-                    (outer_radius - affected_distances) / (outer_radius - inner_radius),
-                    0.0,
-                    1.0,
-                )
-                weights[affected_distances <= inner_radius + 1e-12] = 1.0
-        if self.replace_existing:
-            after_values[vertex_indices] = weights
-            return np.arange(self.mesh_grid.vertex_count(), dtype=np.intp), before_values, after_values
-
-        if self.erase_selection:
-            after_values = weights
-        else:
-            after_values = np.maximum(before_values, weights)
-        return vertex_indices, before_values, after_values
-
-
-@dataclass(slots=True)
-class SelectionLayerCommand:
-    """Apply a bulk update to the mesh-backed selection layer."""
-
-    mesh_grid: IcosphereGrid
-    after_values: np.ndarray
-    apply_selection_values: Callable[[np.ndarray, np.ndarray], None]
-    vertex_indices: np.ndarray = field(init=False, repr=False)
-    before_values: np.ndarray = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self.vertex_indices = np.arange(self.mesh_grid.vertex_count(), dtype=np.intp)
-        self.before_values = self.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values.astype(
-            np.float64,
-            copy=True,
-        )
-        self.after_values = np.clip(np.asarray(self.after_values, dtype=np.float64), 0.0, 1.0)
-        if self.after_values.shape != self.before_values.shape:
-            raise ValueError(
-                "Selection layer update must contain one value per mesh vertex, "
-                f"got {self.after_values.shape} for {self.before_values.shape}."
-            )
-
-    def redo(self) -> None:
-        self.apply_selection_values(self.vertex_indices, self.after_values)
-
-    def undo(self) -> None:
-        self.apply_selection_values(self.vertex_indices, self.before_values)
+__all__ = ["BrushCommand", "BrushPaintCommand", "SelectionBrushCommand", "SelectionLayerCommand"]

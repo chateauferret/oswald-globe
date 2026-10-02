@@ -45,7 +45,8 @@ try:
     from .icosphere_grid import IcosphereGrid
     from .icosphere_build_worker import IcosphereBuildWorker
     from .icosphere_progress_dialog import IcosphereProgressDialog
-    from .tools import BrushTool, NavigateTool, PaintTool, SelectTool, Tool
+    from .filters import Filter, load_filters
+    from .tools import BrushTool, PaintTool, SelectTool, Tool, load_tools
     from .project import Project
     from .settings_dialog import SettingsDialog
     from .undo_stack import BrushPaintCommand, SelectionBrushCommand, SelectionLayerCommand, UndoStack
@@ -57,7 +58,8 @@ except ImportError:  # pragma: no cover - supports running as a script
     from oswald_globe.icosphere_grid import IcosphereGrid
     from oswald_globe.icosphere_build_worker import IcosphereBuildWorker
     from oswald_globe.icosphere_progress_dialog import IcosphereProgressDialog
-    from oswald_globe.tools import BrushTool, NavigateTool, PaintTool, SelectTool, Tool
+    from oswald_globe.filters import Filter, load_filters
+    from oswald_globe.tools import BrushTool, PaintTool, SelectTool, Tool, load_tools
     from oswald_globe.project import Project
     from oswald_globe.settings_dialog import SettingsDialog
     from oswald_globe.undo_stack import BrushPaintCommand, SelectionBrushCommand, SelectionLayerCommand, UndoStack
@@ -395,12 +397,10 @@ class GlobeMainWindow(QMainWindow):
         self._settings = settings or APP_SETTINGS
         self._legend_action_group: Optional[QActionGroup] = None
         self._tool_action_group: Optional[QActionGroup] = None
+        self._filter_action_group: Optional[QActionGroup] = None
         self._undo_stack = UndoStack(on_changed=self._on_project_state_changed)
-        self._tools: Dict[str, Tool] = {
-            "navigate": NavigateTool(self),
-            "select": SelectTool(self, self._sync_tool_mode_to_viewer),
-            "paint": PaintTool(self, self._sync_tool_mode_to_viewer),
-        }
+        self._tools: Dict[str, Tool] = load_tools(self, self._sync_tool_mode_to_viewer)
+        self._filters: Dict[str, Filter] = load_filters(self)
         self._active_tool: Optional[Tool] = None
         self._active_tool_name: Optional[str] = None
         self._file_menu: Optional[QMenu] = None
@@ -409,6 +409,7 @@ class GlobeMainWindow(QMainWindow):
         self._undo_action: Optional[QAction] = None
         self._redo_action: Optional[QAction] = None
         self._tools_menu: Optional[QMenu] = None
+        self._filters_menu: Optional[QMenu] = None
         self._view_menu: Optional[QMenu] = None
         self._current_legend = self._load_current_legend()
         self._load_thread: Optional[QThread] = None
@@ -507,28 +508,28 @@ class GlobeMainWindow(QMainWindow):
         self._tool_action_group = QActionGroup(self._tools_menu)
         self._tool_action_group.setExclusive(True)
 
-        self._tools["navigate"].create_menu_action(
-            self._tools_menu,
-            self._tool_action_group,
-            on_selected=lambda: self._set_active_tool("navigate"),
-        )
+        for tool_name, tool in self._tools.items():
+            tool.create_menu_action(
+                self._tools_menu,
+                self._tool_action_group,
+                on_selected=lambda tool_name=tool_name: self._set_active_tool(tool_name),
+            )
 
-        self._tools["select"].create_menu_action(
-            self._tools_menu,
-            self._tool_action_group,
-            on_selected=lambda: self._set_active_tool("select"),
-        )
+        default_tool_name = "navigate" if "navigate" in self._tools else next(iter(self._tools))
+        default_tool = self._tools[default_tool_name]
+        if default_tool.menu_action is None:
+            raise RuntimeError(f"{default_tool_name!r} tool menu action was not created.")
+        default_tool.menu_action.setChecked(True)
+        self._set_active_tool(default_tool_name)
 
-        self._tools["paint"].create_menu_action(
-            self._tools_menu,
-            self._tool_action_group,
-            on_selected=lambda: self._set_active_tool("paint"),
-        )
-
-        if self._tools["navigate"].menu_action is None:
-            raise RuntimeError("Navigate tool menu action was not created.")
-        self._tools["navigate"].menu_action.setChecked(True)
-        self._set_active_tool("navigate")
+        self._filters_menu = self.menuBar().addMenu("Filters")
+        self._filter_action_group = QActionGroup(self._filters_menu)
+        for filter_name, filter_obj in self._filters.items():
+            filter_obj.create_menu_action(
+                self._filters_menu,
+                self._filter_action_group,
+                on_selected=lambda filter_name=filter_name: self._apply_filter(filter_name),
+            )
 
         self._view_menu = self.menuBar().addMenu("View")
         self._legend_menu = self._view_menu.addMenu("Legend")
@@ -548,21 +549,21 @@ class GlobeMainWindow(QMainWindow):
         self._active_tool.show_options_dialog()
         self._sync_tool_mode_to_viewer()
 
+    def _apply_filter(self, filter_name: str) -> None:
+        filter_obj = self._filters.get(filter_name)
+        if filter_obj is None:
+            raise ValueError(f"Unknown filter selection: {filter_name}")
+        filter_obj.show_options_dialog()
+
     def _sync_tool_mode_to_viewer(self) -> None:
         gl_widget = getattr(self.viewer, "gl_widget", None)
         if gl_widget is None:
             return
         gl_widget.set_tool_mode(self._active_tool_name or "navigate")
+        gl_widget.set_tool(self._active_tool)
         brush_tool = self._tools.get(self._active_tool_name or "")
         if isinstance(brush_tool, BrushTool):
             gl_widget.set_paint_brush(brush_tool.radius_km(), brush_tool.falloff_percent())
-        paint_tool = self._tools.get("paint")
-        if self._active_tool_name == "paint":
-            gl_widget.set_brush_command_factory(self._create_brush_command)
-        elif self._active_tool_name == "select":
-            gl_widget.set_brush_command_factory(self._create_select_command)
-        else:
-            gl_widget.set_brush_command_factory(None)
         gl_widget.set_undo_stack(self._undo_stack)
 
     def _create_brush_command(self, payload: Dict[str, object]) -> BrushPaintCommand:

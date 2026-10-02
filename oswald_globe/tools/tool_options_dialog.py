@@ -5,7 +5,17 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QAbstractSpinBox, QComboBox, QDialog, QGridLayout, QLabel, QSlider, QSpinBox, QWidget
+from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QComboBox,
+    QDialog,
+    QGridLayout,
+    QLabel,
+    QSlider,
+    QSizePolicy,
+    QSpinBox,
+    QWidget,
+)
 
 
 class ToolOptionsDialog(QDialog):
@@ -64,6 +74,8 @@ class ToolOptionsDialog(QDialog):
         falloff_percent: int = 50,
         include_value: bool = True,
         include_mode: bool = True,
+        include_radius: bool = True,
+        include_falloff: bool = True,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -112,10 +124,24 @@ class ToolOptionsDialog(QDialog):
         else:
             self.mode_combo.hide()
 
-        layout.addWidget(QLabel("Radius (km)"), row, 0)
-        layout.addWidget(self.radius_slider, row, 1)
-        layout.addWidget(self.radius_spin, row, 2)
-        row += 1
-        layout.addWidget(QLabel("Falloff (%)"), row, 0)
-        layout.addWidget(self.falloff_slider, row, 1)
-        layout.addWidget(self.falloff_spin, row, 2)
+        if include_radius:
+            layout.addWidget(QLabel("Radius (km)"), row, 0)
+            layout.addWidget(self.radius_slider, row, 1)
+            layout.addWidget(self.radius_spin, row, 2)
+            row += 1
+        else:
+            self.radius_slider.hide()
+            self.radius_spin.hide()
+
+        if include_falloff:
+            layout.addWidget(QLabel("Falloff (%)"), row, 0)
+            layout.addWidget(self.falloff_slider, row, 1)
+            layout.addWidget(self.falloff_spin, row, 2)
+        else:
+            self.falloff_slider.hide()
+            self.falloff_spin.hide()
+
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(2, 0)
+        self.value_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.value_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)

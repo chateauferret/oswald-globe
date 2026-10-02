@@ -60,6 +60,70 @@ def test_resources_module_importable():
     assert hasattr(resources_rc, "qInitResources")
 
 
+def test_tool_loader_discovers_plugins_in_tools_directory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    import importlib
+
+    plugin_path = tmp_path / "demo_tool.py"
+    plugin_path.write_text(
+        "from oswald_globe.tools.tool import Tool\n"
+        "\n"
+        "class DemoTool(Tool):\n"
+        "    _menu_label = 'Demo'\n"
+        "\n"
+        "    def __init__(self, parent=None, on_brush_changed=None):\n"
+        "        super().__init__(parent)\n"
+        "        self._on_brush_changed = on_brush_changed\n"
+        "\n"
+        "    def create_menu_action(self, tools_menu, action_group, on_selected):\n"
+        "        return None\n"
+    )
+
+    import oswald_globe.tools as tools_package
+
+    monkeypatch.setattr(tools_package, "__path__", [str(tmp_path)])
+    sys.modules.pop("oswald_globe.tools.demo_tool", None)
+
+    discovered = tools_package.discover_tools()
+    assert "demo" in discovered
+
+    loaded = tools_package.load_tools(parent=object(), on_brush_changed=lambda: None)
+    assert "demo" in loaded
+    assert isinstance(loaded["demo"], importlib.import_module("oswald_globe.tools.demo_tool").DemoTool)
+
+
+def test_filter_loader_discovers_plugins_in_filters_directory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    import importlib
+
+    plugin_path = tmp_path / "demo_filter.py"
+    plugin_path.write_text(
+        "from oswald_globe.filters.filter import Filter\n"
+        "\n"
+        "class DemoFilter(Filter):\n"
+        "    _menu_label = 'Demo'\n"
+        "\n"
+        "    def __init__(self, parent=None):\n"
+        "        super().__init__(parent)\n"
+        "\n"
+        "    def create_menu_action(self, filters_menu, action_group, on_selected):\n"
+        "        return None\n"
+        "\n"
+        "    def apply(self, gl_widget):\n"
+        "        return None\n"
+    )
+
+    import oswald_globe.filters as filters_package
+
+    monkeypatch.setattr(filters_package, "__path__", [str(tmp_path)])
+    sys.modules.pop("oswald_globe.filters.demo_filter", None)
+
+    discovered = filters_package.discover_filters()
+    assert "demo" in discovered
+
+    loaded = filters_package.load_filters(parent=object())
+    assert "demo" in loaded
+    assert isinstance(loaded["demo"], importlib.import_module("oswald_globe.filters.demo_filter").DemoFilter)
+
+
 def test_app_help_when_run_as_script():
     project_root = Path(__file__).resolve().parent.parent
     app_path = project_root / "oswald_globe" / "app.py"
@@ -136,7 +200,7 @@ def test_create_window(qapp, tmp_path: Path):
     assert window.windowTitle().endswith("[*]")
     assert _project_window_title(window) == "globe"
     assert window.centralWidget() is not None
-    assert [action.text() for action in window.menuBar().actions()] == ["File", "Edit", "Select", "Tools", "View"]
+    assert [action.text() for action in window.menuBar().actions()] == ["File", "Edit", "Select", "Tools", "Filters", "View"]
     assert window._file_menu is not None
     assert [action.text() for action in window._file_menu.actions() if action.text()] == [
         "New",
@@ -156,6 +220,8 @@ def test_create_window(qapp, tmp_path: Path):
     assert window._tools_menu is not None
     assert [action.text() for action in window._tools_menu.actions()] == ["Navigate", "Select", "Paint"]
     assert [action.text() for action in window._tools_menu.actions() if action.isChecked()] == ["Navigate"]
+    assert window._filters_menu is not None
+    assert [action.text() for action in window._filters_menu.actions()] == ["Fill"]
 
     assert window._legend_menu is not None
     assert window._legend_menu.toolTipsVisible() is True

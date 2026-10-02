@@ -254,6 +254,7 @@ class GlobeGLWidget(QOpenGLWidget):
         self._hover_target_lon = 0.0
         self._select_alt_mode = False
         self._undo_stack: Optional[UndoStack] = None
+        self._tool: Optional[Any] = None
         self._brush_command_factory: Optional[Callable[[Dict[str, Any]], UndoableCommand]] = None
 
         # Downsample data grid for tooltips and texture if needed
@@ -787,6 +788,13 @@ class GlobeGLWidget(QOpenGLWidget):
     def set_undo_stack(self, undo_stack: Optional[UndoStack]) -> None:
         self._undo_stack = undo_stack
 
+    def set_tool(self, tool: Optional[Any]) -> None:
+        self._tool = tool
+        if tool is None or not hasattr(tool, "create_brush_command"):
+            self._brush_command_factory = None
+            return
+        self._brush_command_factory = lambda payload: tool.create_brush_command(payload, self)
+
     def set_brush_command_factory(
         self,
         factory: Optional[Callable[[Dict[str, Any]], UndoableCommand]],
@@ -1252,30 +1260,48 @@ class GlobeGLWidget(QOpenGLWidget):
         replace_existing: bool = False,
         erase_selection: bool = False,
     ) -> None:
+        if self._brush_command_factory is not None:
+            if pt is None:
+                self._mouse_over_globe = False
+                self._refresh_cursor()
+                return
+
+            self._mouse_over_globe = True
+            self._hover_target_lat = pt["target_lat"]
+            self._hover_target_lon = pt["target_lon"]
+
+            if self._undo_stack is None:
+                raise RuntimeError("Brush command handling has not been configured.")
+
+            payload = {
+                "target_lat_deg": math.degrees(pt["target_lat"]),
+                "target_lon_deg": math.degrees(pt["target_lon"]),
+                "radius_km": self._paint_brush_radius_km,
+                "falloff_percent": self.paint_dropoff_percent,
+            }
+            if replace_existing:
+                payload["replace_existing"] = True
+            if erase_selection:
+                payload["erase_selection"] = True
+            command = self._brush_command_factory(payload)
+            self._undo_stack.push(command)
+            return
+
+        if self._tool is not None and hasattr(self._tool, "apply_interaction"):
+            self._tool.apply_interaction(
+                self,
+                pt,
+                replace_existing=replace_existing,
+                erase_selection=erase_selection,
+            )
+            return
+
         if pt is None:
             self._mouse_over_globe = False
             self._refresh_cursor()
             return
 
-        self._mouse_over_globe = True
-        self._hover_target_lat = pt["target_lat"]
-        self._hover_target_lon = pt["target_lon"]
-
-        if self._brush_command_factory is None or self._undo_stack is None:
-            raise RuntimeError("Brush command handling has not been configured.")
-
-        payload = {
-            "target_lat_deg": math.degrees(pt["target_lat"]),
-            "target_lon_deg": math.degrees(pt["target_lon"]),
-            "radius_km": self._paint_brush_radius_km,
-            "falloff_percent": self.paint_dropoff_percent,
-        }
-        if replace_existing:
-            payload["replace_existing"] = True
-        if erase_selection:
-            payload["erase_selection"] = True
-        command = self._brush_command_factory(payload)
-        self._undo_stack.push(command)
+        raise RuntimeError("Brush command handling has not been configured.")
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
