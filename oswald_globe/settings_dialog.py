@@ -4,19 +4,21 @@ from __future__ import annotations
 
 from typing import Callable, Dict, Optional, Union
 
+from PySide6.QtCore import QSettings
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QTabWidget, QVBoxLayout, QWidget
 
 from oswald_globe.globe_viewer import GlobeViewer
-from oswald_globe.grid_settings_tab import GridSettingsTab
+from oswald_globe.grid_settings_tab import ApplicationSettingsTab, GridSettingsTab
 
 
 class SettingsDialog(QDialog):
     def __init__(
         self,
         viewer: GlobeViewer,
-        apply_callback: Callable[[Dict[str, Dict[str, Union[bool, float, QColor]]]], None],
+        apply_callback: Callable[..., None],
         parent: Optional[QWidget] = None,
+        settings: Optional[QSettings] = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Settings")
@@ -27,7 +29,9 @@ class SettingsDialog(QDialog):
         main_layout = QVBoxLayout(self)
         self.tabs = QTabWidget(self)
         self.grid_tab = GridSettingsTab(viewer, self.tabs)
+        self.application_tab = ApplicationSettingsTab(settings, self.tabs)
         self.tabs.addTab(self.grid_tab, "Grids")
+        self.tabs.addTab(self.application_tab, "Application")
         main_layout.addWidget(self.tabs)
 
         buttons = QDialogButtonBox(self)
@@ -40,7 +44,7 @@ class SettingsDialog(QDialog):
         main_layout.addWidget(buttons)
 
     def apply_changes(self) -> None:
-        self._apply_callback(self.grid_tab.settings())
+        self._apply_callback(self.grid_tab.settings(), self.application_tab.settings())
 
     def accept_changes(self) -> None:
         self.apply_changes()

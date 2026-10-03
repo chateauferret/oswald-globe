@@ -12,12 +12,14 @@ from PySide6.QtWidgets import QComboBox, QFileDialog, QMessageBox, QProgressBar,
 import oswald_globe.app as app_module
 from oswald_globe.app import IcosphereProgressDialog, create_window, load_elevation
 from oswald_globe import globe_main_window
+from oswald_globe.app_support import APP_SETTINGS
 from oswald_globe.globe_main_window import (
     TiffExportProgressDialog,
     TiffImportProgressDialog,
     TiffImportWorker,
     _load_tiff_import_raster,
 )
+from oswald_globe.settings_dialog import SettingsDialog
 from oswald_globe.icosphere_grid import IcosphereGrid
 from oswald_globe.project import Project
 from oswald_globe.undo_stack import BrushPaintCommand, SelectionBrushCommand, UndoStack
@@ -54,10 +56,65 @@ def test_create_window_defaults_to_empty_sea_level_globe(qapp):
         window.close()
 
 
+def test_settings_dialog_has_application_tab(qapp):
+    window = create_window()
+    try:
+        window._settings.remove("application/initial_grid_depth")
+        window._settings.remove("application/maximum_vertex_count")
+        window._settings.sync()
+        dialog = SettingsDialog(window.viewer, window.apply_grid_settings, window, settings=window._settings)
+        try:
+            assert [dialog.tabs.tabText(index) for index in range(dialog.tabs.count())] == ["Grids", "Application"]
+            app_settings = dialog.application_tab.settings()
+            assert app_settings == {"initial_grid_depth": 6, "maximum_vertex_count": 1_000_000}
+            assert dialog.application_tab._initial_grid_depth.minimum() == 4
+            assert dialog.application_tab._initial_grid_depth.maximum() == 8
+            assert dialog.application_tab._initial_grid_depth.singleStep() == 1
+            assert dialog.application_tab._maximum_vertex_count.minimum() == 100_000
+            assert dialog.application_tab._maximum_vertex_count.maximum() == 2_000_000
+            assert dialog.application_tab._maximum_vertex_count.singleStep() == 100_000
+        finally:
+            dialog.close()
+    finally:
+        window.close()
+
+
 def test_resources_module_importable():
     from oswald_globe import resources_rc
 
     assert hasattr(resources_rc, "qInitResources")
+
+
+def test_app_settings_persist_in_resources_directory():
+    path = Path(APP_SETTINGS.fileName())
+    assert path.parent.name == "resources"
+    assert path.name == "settings.ini"
+
+    APP_SETTINGS.setValue("test/persisted_flag", True)
+    APP_SETTINGS.sync()
+    reloaded = QSettings(str(path), QSettings.Format.IniFormat)
+    assert reloaded.value("test/persisted_flag", False) in (True, "true", 1)
+    reloaded.remove("test/persisted_flag")
+    reloaded.sync()
+
+
+def test_new_project_uses_current_initial_grid_depth_setting(qapp, tmp_path: Path):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("application/initial_grid_depth", 5)
+
+    window = create_window(settings=settings)
+    try:
+        assert window._initial_grid_depth == 5
+        assert window.viewer.gl_widget.mesh_grid is not None
+        assert window.viewer.gl_widget.mesh_grid.vertex_count() == 10 * (4 ** 5) + 2
+
+        settings.setValue("application/initial_grid_depth", 6)
+        window.new_project()
+        assert window._initial_grid_depth == 6
+        assert window.viewer.gl_widget.mesh_grid is not None
+        assert window.viewer.gl_widget.mesh_grid.vertex_count() == 10 * (4 ** 6) + 2
+    finally:
+        window.close()
 
 
 def test_tool_loader_discovers_plugins_in_tools_directory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1393,6 +1450,33 @@ def test_select_menu_actions_update_selection_and_support_undo(qapp):
         window._undo_stack.undo()
         np.testing.assert_allclose(selection.values, original)
     finally:
+        window.close()
+
+
+def test_grid_detail_actions_update_mesh_and_vertex_count_label(qapp, tmp_path: Path):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("application/initial_grid_depth", 4)
+    window = create_window(settings=settings)
+    try:
+        mesh_grid = window.viewer.gl_widget.mesh_grid
+        assert mesh_grid is not None
+
+        selection = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+        selection.values[:] = 1.0
+
+        original_vertex_count = mesh_grid.vertex_count()
+        window.add_grid_detail()
+        refined_vertex_count = mesh_grid.vertex_count()
+        assert refined_vertex_count > original_vertex_count
+        assert window.viewer.footer_left_label.text() == f"{refined_vertex_count:,} vertices"
+
+        window.remove_grid_detail()
+        coarsened_vertex_count = mesh_grid.vertex_count()
+        assert coarsened_vertex_count < refined_vertex_count
+        assert window.viewer.footer_left_label.text() == f"{coarsened_vertex_count:,} vertices"
+    finally:
+        window._project_metadata_dirty = False
+        window._undo_stack.set_clean()
         window.close()
 
 

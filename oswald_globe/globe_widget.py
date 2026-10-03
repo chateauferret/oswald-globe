@@ -361,6 +361,72 @@ class GlobeGLWidget(QOpenGLWidget):
         glBufferData(GL_ARRAY_BUFFER, heights.nbytes, heights, GL_STATIC_DRAW)
         self.doneCurrent()
 
+    def rebuild_mesh_geometry(self) -> None:
+        if not self.has_mesh or self.mesh_grid is None:
+            raise RuntimeError("Geometry rebuild requires a mesh-backed globe.")
+
+        grid = self.mesh_grid
+        positions = grid.vertices[:, [1, 2, 0]].astype(np.float32)
+        normals = positions
+        heights = grid.values.astype(np.float32)
+        tex_coords = np.zeros((len(positions), 2), dtype=np.float32)
+
+        leaves = grid.leaf_faces()
+        indices = np.array([f.v for f in leaves], dtype=np.uint32).reshape(-1)
+
+        dual_positions = grid.dual_vertices()[:, [1, 2, 0]].astype(np.float32)
+        dual_line_indices = grid.dual_edges().astype(np.uint32).reshape(-1)
+        selection_positions, self.selection_vertex_ranges = grid.dual_cell_line_segments()
+        selection_positions = selection_positions[:, [1, 2, 0]].astype(np.float32)
+
+        self.index_count = len(indices)
+        if not self._gl_initialized:
+            self._mesh_raster_dirty = True
+            self.update()
+            return
+
+        self.makeCurrent()
+        glBindBuffer(GL_ARRAY_BUFFER, self.pos_vbo)
+        glBufferData(GL_ARRAY_BUFFER, positions.nbytes, positions, GL_STATIC_DRAW)
+
+        glBindBuffer(GL_ARRAY_BUFFER, self.norm_vbo)
+        glBufferData(GL_ARRAY_BUFFER, normals.nbytes, normals, GL_STATIC_DRAW)
+
+        glBindBuffer(GL_ARRAY_BUFFER, self.tex_vbo)
+        glBufferData(GL_ARRAY_BUFFER, tex_coords.nbytes, tex_coords, GL_STATIC_DRAW)
+
+        glBindBuffer(GL_ARRAY_BUFFER, self.height_vbo)
+        glBufferData(GL_ARRAY_BUFFER, heights.nbytes, heights, GL_STATIC_DRAW)
+
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.index_ebo)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_STATIC_DRAW)
+
+        if len(dual_line_indices) > 0:
+            self.dual_line_count = len(dual_line_indices)
+            if self.dual_pos_vbo == 0:
+                self.dual_pos_vbo = glGenBuffers(1)
+            glBindBuffer(GL_ARRAY_BUFFER, self.dual_pos_vbo)
+            glBufferData(GL_ARRAY_BUFFER, dual_positions.nbytes, dual_positions, GL_STATIC_DRAW)
+
+            if self.dual_line_ebo == 0:
+                self.dual_line_ebo = glGenBuffers(1)
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.dual_line_ebo)
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, dual_line_indices.nbytes, dual_line_indices, GL_STATIC_DRAW)
+        else:
+            self.dual_line_count = 0
+
+        if len(selection_positions) > 0:
+            if self.selection_pos_vbo == 0:
+                self.selection_pos_vbo = glGenBuffers(1)
+            glBindBuffer(GL_ARRAY_BUFFER, self.selection_pos_vbo)
+            glBufferData(GL_ARRAY_BUFFER, selection_positions.nbytes, selection_positions, GL_STATIC_DRAW)
+        else:
+            self.selection_vertex_ranges = None
+
+        self.doneCurrent()
+        self._mesh_raster_dirty = True
+        self.update()
+
     def apply_mesh_vertex_values(self, vertex_indices: np.ndarray, values: np.ndarray) -> None:
         if not self.has_mesh or self.mesh_grid is None:
             raise RuntimeError("Painting requires a mesh-backed globe.")

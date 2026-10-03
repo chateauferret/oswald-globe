@@ -391,10 +391,11 @@ class GlobeMainWindow(QMainWindow):
         self._mesh_min_level = mesh_min_level
         self._mesh_max_level = mesh_max_level
         self._mesh_threshold = mesh_threshold
+        self._settings = settings or APP_SETTINGS
+        self._initial_grid_depth = self._read_initial_grid_depth_setting()
         self._project_metadata_dirty = False
         self._save_path: Optional[Path] = None
         self._export_path: Optional[Path] = None
-        self._settings = settings or APP_SETTINGS
         self._legend_action_group: Optional[QActionGroup] = None
         self._tool_action_group: Optional[QActionGroup] = None
         self._filter_action_group: Optional[QActionGroup] = None
@@ -405,6 +406,7 @@ class GlobeMainWindow(QMainWindow):
         self._active_tool_name: Optional[str] = None
         self._file_menu: Optional[QMenu] = None
         self._edit_menu: Optional[QMenu] = None
+        self._grid_menu: Optional[QMenu] = None
         self._select_menu: Optional[QMenu] = None
         self._undo_action: Optional[QAction] = None
         self._redo_action: Optional[QAction] = None
@@ -489,6 +491,16 @@ class GlobeMainWindow(QMainWindow):
         self._redo_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Redo))
         self._redo_action.triggered.connect(self._undo_stack.redo)
         self._edit_menu.addAction(self._redo_action)
+
+        self._grid_menu = self._edit_menu.addMenu("Grid")
+
+        add_detail_action = QAction("Add detail", self)
+        add_detail_action.triggered.connect(self.add_grid_detail)
+        self._grid_menu.addAction(add_detail_action)
+
+        remove_detail_action = QAction("Remove detail", self)
+        remove_detail_action.triggered.connect(self.remove_grid_detail)
+        self._grid_menu.addAction(remove_detail_action)
 
         self._select_menu = self.menuBar().addMenu("Select")
 
@@ -636,6 +648,29 @@ class GlobeMainWindow(QMainWindow):
         command = self._create_selection_layer_command(1.0 - selection_values)
         self._undo_stack.push(command)
 
+    def _refresh_after_grid_detail_change(self) -> None:
+        self.viewer.gl_widget.rebuild_mesh_geometry()
+        self.viewer.refresh_vertex_count()
+        self._mark_project_metadata_dirty()
+
+    @Slot()
+    def add_grid_detail(self) -> None:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Add detail requires a mesh-backed globe.")
+        if mesh_grid.subdivide_selected_faces_once() <= 0:
+            return
+        self._refresh_after_grid_detail_change()
+
+    @Slot()
+    def remove_grid_detail(self) -> None:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Remove detail requires a mesh-backed globe.")
+        if mesh_grid.remove_selected_lowest_level_vertices() <= 0:
+            return
+        self._refresh_after_grid_detail_change()
+
     def _sync_edit_actions(self) -> None:
         if self._undo_action is not None:
             self._undo_action.setEnabled(self._undo_stack.can_undo())
@@ -782,6 +817,7 @@ class GlobeMainWindow(QMainWindow):
     def new_project(self) -> None:
         if not self._confirm_discard_or_save_changes("starting a new project"):
             return
+        self._initial_grid_depth = self._read_initial_grid_depth_setting()
         self._set_heightfield(None)
 
     def _start_heightfield_load(self, heightfield: Path, elevation: np.ndarray) -> None:
@@ -1016,6 +1052,22 @@ class GlobeMainWindow(QMainWindow):
             self._export_thread = None
         self._pending_export_path = None
 
+    def _ensure_application_settings_defaults(self) -> None:
+        if self._settings.value("application/initial_grid_depth") is None:
+            self._settings.setValue("application/initial_grid_depth", 6)
+        if self._settings.value("application/maximum_vertex_count") is None:
+            self._settings.setValue("application/maximum_vertex_count", 1_000_000)
+        self._settings.sync()
+
+    def _read_initial_grid_depth_setting(self) -> int:
+        self._ensure_application_settings_defaults()
+        value = self._settings.value("application/initial_grid_depth", 6)
+        try:
+            depth = int(value)
+        except (TypeError, ValueError):
+            depth = 6
+        return max(4, min(8, depth))
+
     def _set_heightfield(
         self,
         heightfield: Optional[Path],
@@ -1031,7 +1083,7 @@ class GlobeMainWindow(QMainWindow):
         if heightfield is None:
             elevation_data = empty_globe_elevation() if elevation is None else np.asarray(elevation, dtype=np.float32)
             view_title = "Sea level"
-            mesh = mesh_grid if mesh_grid is not None else generic_icosphere_mesh(self._mesh_max_level)
+            mesh = mesh_grid if mesh_grid is not None else generic_icosphere_mesh(self._initial_grid_depth)
             viewer = GlobeViewer(
                 elevation_data,
                 cmap=load_topo_cmap(self._ensure_current_legend(), name=self._legend_name(self._current_legend)),
@@ -1176,12 +1228,21 @@ class GlobeMainWindow(QMainWindow):
         )
 
     def open_settings(self) -> None:
-        dialog = SettingsDialog(self.viewer, self.apply_grid_settings, self)
+        dialog = SettingsDialog(self.viewer, self.apply_grid_settings, self, settings=self._settings)
         dialog.exec()
 
-    def apply_grid_settings(self, settings: Dict[str, Dict[str, Union[bool, float, QColor]]]) -> None:
+    def apply_grid_settings(
+        self,
+        settings: Dict[str, Dict[str, Union[bool, float, QColor]]],
+        application_settings: Optional[Dict[str, int]] = None,
+    ) -> None:
         self._apply_grid_settings_to_viewer(self.viewer, settings)
         self._save_grid_settings()
+        if application_settings is not None:
+            self._settings.setValue("application/initial_grid_depth", int(application_settings.get("initial_grid_depth", 6)))
+            self._settings.setValue("application/maximum_vertex_count", int(application_settings.get("maximum_vertex_count", 1_000_000)))
+            self._settings.sync()
+            self._initial_grid_depth = self._read_initial_grid_depth_setting()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if not self._confirm_discard_or_save_changes("closing the application"):

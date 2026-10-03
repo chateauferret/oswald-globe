@@ -4,11 +4,52 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Tuple, Union
 
+from PySide6.QtCore import QSettings
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QCheckBox, QDoubleSpinBox, QGridLayout, QLabel, QWidget
+from PySide6.QtWidgets import QCheckBox, QDoubleSpinBox, QGridLayout, QLabel, QSpinBox, QWidget
 
+from oswald_globe.app_support import APP_SETTINGS
 from oswald_globe.color_button import ColorButton
 from oswald_globe.globe_viewer import GlobeViewer
+
+
+class ApplicationSettingsTab(QWidget):
+    DEFAULT_INITIAL_GRID_DEPTH = 6
+    DEFAULT_MAXIMUM_VERTEX_COUNT = 1_000_000
+
+    def __init__(self, settings: Optional[QSettings] = None, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._settings = settings or APP_SETTINGS
+
+        layout = QGridLayout(self)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(8)
+
+        layout.addWidget(QLabel("Initial grid depth"), 0, 0)
+        self._initial_grid_depth = QSpinBox(self)
+        self._initial_grid_depth.setRange(4, 8)
+        self._initial_grid_depth.setSingleStep(1)
+        self._initial_grid_depth.setValue(
+            int(self._settings.value("application/initial_grid_depth", self.DEFAULT_INITIAL_GRID_DEPTH))
+        )
+        layout.addWidget(self._initial_grid_depth, 0, 1)
+
+        layout.addWidget(QLabel("Maximum vertex count"), 1, 0)
+        self._maximum_vertex_count = QSpinBox(self)
+        self._maximum_vertex_count.setRange(100_000, 2_000_000)
+        self._maximum_vertex_count.setSingleStep(100_000)
+        self._maximum_vertex_count.setValue(
+            int(self._settings.value("application/maximum_vertex_count", self.DEFAULT_MAXIMUM_VERTEX_COUNT))
+        )
+        layout.addWidget(self._maximum_vertex_count, 1, 1)
+
+        layout.setRowStretch(2, 1)
+
+    def settings(self) -> Dict[str, int]:
+        return {
+            "initial_grid_depth": int(self._initial_grid_depth.value()),
+            "maximum_vertex_count": int(self._maximum_vertex_count.value()),
+        }
 
 
 class GridSettingsTab(QWidget):

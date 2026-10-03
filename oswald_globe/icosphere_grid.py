@@ -292,6 +292,31 @@ class IcosphereGrid:
             _Face((c, b, v2), face.level + 1),
             _Face((a, b, c), face.level + 1),
         ]
+        return a, b, c
+
+    @staticmethod
+    def _interpolate_edge_value(value_a: float, value_b: float, default_value: float) -> float:
+        a_is_finite = np.isfinite(value_a)
+        b_is_finite = np.isfinite(value_b)
+        if a_is_finite and b_is_finite:
+            return float((value_a + value_b) * 0.5)
+        if a_is_finite:
+            return float(value_a)
+        if b_is_finite:
+            return float(value_b)
+        return float(default_value)
+
+    @staticmethod
+    def _face_child_midpoints(face: _Face) -> Tuple[int, int, int]:
+        if face.children is None or len(face.children) != 4:
+            raise ValueError("Expected a subdivided face with exactly four children.")
+        child0, child1, _, child3 = face.children
+        a = int(child0.v[1])
+        c = int(child0.v[2])
+        b = int(child1.v[2])
+        if {a, b, c} != set(child3.v):
+            raise ValueError("Face children do not match the expected red-refinement topology.")
+        return a, b, c
 
     def subdivide_uniform(self, levels: int):
         """Uniformly subdivide every current leaf face `levels` times."""
@@ -299,6 +324,105 @@ class IcosphereGrid:
             for leaf in self._red_leaves():
                 self._subdivide(leaf)
             self._invalidate_caches()
+
+    def subdivide_selected_faces_once(self) -> int:
+        """Subdivide once every red leaf face whose three vertices are selected."""
+        selection_values = self.get_layer(self.SELECTION_LAYER_NAME).values
+        selected_faces = [
+            face
+            for face in self._red_leaves()
+            if np.all(selection_values[np.asarray(face.v, dtype=np.intp)] > 0.0)
+        ]
+        if not selected_faces:
+            return 0
+
+        for face in selected_faces:
+            v0, v1, v2 = face.v
+            a, b, c = self._subdivide(face)
+            for layer_name in self.layer_names():
+                layer = self._layers[layer_name]
+                default_value = self._default_layer_fill_value(layer_name)
+                layer.values[a] = self._interpolate_edge_value(layer.values[v0], layer.values[v1], default_value)
+                layer.values[b] = self._interpolate_edge_value(layer.values[v1], layer.values[v2], default_value)
+                layer.values[c] = self._interpolate_edge_value(layer.values[v2], layer.values[v0], default_value)
+
+        self._invalidate_caches()
+        return len(selected_faces)
+
+    def _rebuild_edge_midpoints_from_tree(self) -> None:
+        edge_midpoints: Dict[Tuple[int, int], int] = {}
+        stack = list(self.roots)
+        while stack:
+            face = stack.pop()
+            if face.children is None:
+                continue
+            v0, v1, v2 = face.v
+            a, b, c = self._face_child_midpoints(face)
+            edge_midpoints[(min(v0, v1), max(v0, v1))] = a
+            edge_midpoints[(min(v1, v2), max(v1, v2))] = b
+            edge_midpoints[(min(v2, v0), max(v2, v0))] = c
+            stack.extend(face.children)
+        self._edge_midpoints = edge_midpoints
+
+    def _drop_unreferenced_vertices(self) -> int:
+        used_vertex_indices: Set[int] = set()
+        stack = list(self.roots)
+        while stack:
+            face = stack.pop()
+            used_vertex_indices.update(face.v)
+            if face.children is not None:
+                stack.extend(face.children)
+
+        if len(used_vertex_indices) == len(self._vertices):
+            return 0
+
+        old_vertex_count = len(self._vertices)
+        kept_indices = sorted(used_vertex_indices)
+        index_map = {old_index: new_index for new_index, old_index in enumerate(kept_indices)}
+        self._vertices = [self._vertices[index] for index in kept_indices]
+
+        for layer_name in self.layer_names():
+            layer = self._layers[layer_name]
+            layer.values = np.asarray(layer.values[kept_indices], dtype=np.float64)
+
+        stack = list(self.roots)
+        while stack:
+            face = stack.pop()
+            face.v = tuple(index_map[index] for index in face.v)
+            if face.children is not None:
+                stack.extend(face.children)
+
+        return old_vertex_count - len(self._vertices)
+
+    def remove_selected_lowest_level_vertices(self) -> int:
+        """Coarsen one level by collapsing selected deepest red faces and pruning orphaned vertices."""
+        selection_values = self.get_layer(self.SELECTION_LAYER_NAME).values
+        candidates: List[Tuple[_Face, int, int, int, int]] = []
+        stack = list(self.roots)
+        while stack:
+            face = stack.pop()
+            if face.children is None:
+                continue
+            if all(child.is_leaf for child in face.children):
+                a, b, c = self._face_child_midpoints(face)
+                if selection_values[a] > 0.0 and selection_values[b] > 0.0 and selection_values[c] > 0.0:
+                    candidates.append((face, a, b, c, face.children[0].level))
+                continue
+            stack.extend(face.children)
+
+        if not candidates:
+            return 0
+
+        target_level = max(level for _, _, _, _, level in candidates)
+        for face, _, _, _, level in candidates:
+            if level == target_level:
+                face.children = None
+
+        self._rebuild_edge_midpoints_from_tree()
+        removed_vertex_count = self._drop_unreferenced_vertices()
+        self._rebuild_edge_midpoints_from_tree()
+        self._invalidate_caches()
+        return removed_vertex_count
 
     @property
     def vertices(self) -> np.ndarray:

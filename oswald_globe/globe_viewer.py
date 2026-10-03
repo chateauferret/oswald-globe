@@ -323,6 +323,12 @@ class GlobeViewer(QWidget):
         self.lat = lat_deg
         self.lon = lon_deg
 
+    def refresh_vertex_count(self) -> None:
+        if self.gl_widget.mesh_grid is not None:
+            self.footer_left_label.setText(f"{self.gl_widget.mesh_grid.vertex_count():,} vertices")
+        else:
+            self.footer_left_label.setText("🖱️ Drag: Rotate | Scroll: Zoom")
+
     def center(self) -> Tuple[float, float]:
         """Return current center coordinates (lat, lon) in degrees."""
         return (self.lat, self.lon)

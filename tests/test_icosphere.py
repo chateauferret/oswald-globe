@@ -29,6 +29,32 @@ def test_uniform_subdivision_counts():
     assert grid.vertex_count() == expected_v
 
 
+def test_subdivide_selected_faces_once_refines_selected_triangles():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(1)
+    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+    selection.values[:] = 1.0
+
+    subdivided_faces = grid.subdivide_selected_faces_once()
+
+    assert subdivided_faces == 20 * 4
+    assert grid.face_count() == 20 * 4 ** 2
+    assert grid.vertex_count() == 10 * (4 ** 2) + 2
+
+
+def test_remove_selected_lowest_level_vertices_coarsens_selected_detail():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(2)
+    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+    selection.values[:] = 1.0
+
+    removed_vertices = grid.remove_selected_lowest_level_vertices()
+
+    assert removed_vertices > 0
+    assert grid.face_count() == 20 * 4
+    assert grid.vertex_count() == 10 * (4 ** 1) + 2
+
+
 def test_adaptive_refinement_denser_near_bump():
     arr = _bump_map()
     grid = IcosphereGrid.from_equirectangular(arr, min_level=1, max_level=6, threshold=200.0)

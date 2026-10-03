@@ -13,8 +13,11 @@ from PySide6.QtGui import QColor
 from oswald_globe.icosphere_grid import IcosphereGrid
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+RESOURCES_DIR = PACKAGE_ROOT / "oswald_globe" / "resources"
 DEFAULT_HEIGHTFIELD = PACKAGE_ROOT / "data" / "heightfield.tif"
-APP_SETTINGS = QSettings("Oswald Globe", "Oswald Globe")
+APP_SETTINGS_PATH = RESOURCES_DIR / "settings.ini"
+APP_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+APP_SETTINGS = QSettings(str(APP_SETTINGS_PATH), QSettings.Format.IniFormat)
 
 
 def empty_globe_elevation() -> np.ndarray:
