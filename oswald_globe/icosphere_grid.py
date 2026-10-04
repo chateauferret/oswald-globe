@@ -326,7 +326,7 @@ class IcosphereGrid:
             self._invalidate_caches()
 
     def subdivide_selected_faces_once(self) -> int:
-        """Subdivide once every red leaf face whose three vertices are selected."""
+        """Refine selected red leaves once, then balance local transitions."""
         selection_values = self.get_layer(self.SELECTION_LAYER_NAME).values
         selected_faces = [
             face
@@ -337,17 +337,52 @@ class IcosphereGrid:
             return 0
 
         for face in selected_faces:
-            v0, v1, v2 = face.v
-            a, b, c = self._subdivide(face)
-            for layer_name in self.layer_names():
-                layer = self._layers[layer_name]
-                default_value = self._default_layer_fill_value(layer_name)
-                layer.values[a] = self._interpolate_edge_value(layer.values[v0], layer.values[v1], default_value)
-                layer.values[b] = self._interpolate_edge_value(layer.values[v1], layer.values[v2], default_value)
-                layer.values[c] = self._interpolate_edge_value(layer.values[v2], layer.values[v0], default_value)
+            self._subdivide_interpolated(face)
 
         self._invalidate_caches()
+        while faces_to_balance := self._faces_needing_balance(max_neighbors=8):
+            for face in faces_to_balance:
+                self._subdivide_interpolated(face)
+            self._invalidate_caches()
         return len(selected_faces)
+
+    def _subdivide_interpolated(self, face: _Face) -> None:
+        old_vertex_count = self.vertex_count()
+        v0, v1, v2 = face.v
+        midpoints = self._subdivide(face)
+        for midpoint, (a, b) in zip(midpoints, ((v0, v1), (v1, v2), (v2, v0))):
+            # Shared midpoints may already hold edited or sampled layer data.
+            if midpoint < old_vertex_count:
+                continue
+            for layer_name, layer in self._layers.items():
+                layer.values[midpoint] = self._interpolate_edge_value(
+                    layer.values[a], layer.values[b], self._default_layer_fill_value(layer_name)
+                )
+
+    def _faces_needing_balance(self, max_neighbors: Optional[int] = None) -> List[_Face]:
+        leaves = self._red_leaves()
+        faces = [
+            face for face in leaves
+            if any(
+                self._far_side_depth(a, b) >= 2
+                for a, b in ((face.v[0], face.v[1]), (face.v[1], face.v[2]), (face.v[2], face.v[0]))
+            )
+        ]
+        if faces or max_neighbors is None:
+            return faces
+
+        # Count neighbours only after 2:1 balance makes transition faces conforming.
+        crowded = {
+            vertex for vertex, neighbors in self.build_adjacency().items()
+            if len(neighbors) > max_neighbors
+        }
+        return [
+            face for face in leaves
+            if crowded.intersection(face.v) and any(
+                self._far_side_depth(a, b) > 0
+                for a, b in ((face.v[0], face.v[1]), (face.v[1], face.v[2]), (face.v[2], face.v[0]))
+            )
+        ]
 
     def _rebuild_edge_midpoints_from_tree(self) -> None:
         edge_midpoints: Dict[Tuple[int, int], int] = {}
@@ -738,20 +773,13 @@ class IcosphereGrid:
             self._check_cancelled(is_cancelled)
             pass_count += 1
             emit_progress(progress_callback, "balancing-faces", pass_count - 1, pass_count)
-            changed = False
-            leaves = self._red_leaves()
-            for f in leaves:
+            faces_to_balance = self._faces_needing_balance()
+            for f in faces_to_balance:
                 self._check_cancelled(is_cancelled)
-                v0, v1, v2 = f.v
-                if any(
-                    self._far_side_depth(a, b) >= 2
-                    for a, b in ((v0, v1), (v1, v2), (v2, v0))
-                ):
-                    self._subdivide(f)
-                    for child in f.children:
-                        self._ensure_values(child.v, value_fn)
-                    changed = True
-            if changed:
+                self._subdivide(f)
+                for child in f.children:
+                    self._ensure_values(child.v, value_fn)
+            if faces_to_balance:
                 self._invalidate_caches()
                 continue
             break

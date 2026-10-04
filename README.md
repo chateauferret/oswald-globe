@@ -12,6 +12,18 @@ Desktop interactive 3D virtual globe application built with **PySide6 (Qt)** and
 - **Live Tooltip**: Dynamic unprojection and elevation lookup on hover.
 - **QSS Styling**: Clean, dark-mode native desktop UI.
 
+### Adding grid detail
+
+**Grid > Add detail** splits triangles whose three vertices are selected into
+four using shared edge midpoints projected onto the sphere. Neighbouring
+triangles are refined as needed to keep adjacent detail levels within one level
+and transition cells bounded by at most eight neighbours. New vertices
+interpolate all data layers; existing vertex data is preserved.
+
+Refinement stays local, so the coarse/fine boundary has irregular transition
+triangles and cells. A uniform icosphere has only hexagonal cells and twelve
+pentagons; local refinement cannot preserve that topology everywhere.
+
 ## Installation
 
 The `run.sh` script creates the local `.venv` when needed, installs the

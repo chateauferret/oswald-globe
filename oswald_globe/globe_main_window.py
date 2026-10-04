@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from contextlib import contextmanager
 from threading import Event
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Dict, Iterator, Optional, Union
 from PySide6.QtCore import QSize
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QDir, QObject, QSettings, QThread, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QDir, QEvent, QObject, QSettings, QThread, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QIcon, QKeySequence, QLinearGradient, QPainter, QPixmap, QSurfaceFormat
 from PySide6.QtWidgets import (
     QApplication,
@@ -376,6 +377,19 @@ class TiffImportProgressDialog(QDialog):
         self.setWindowTitle("Cancelling TIFF Import")
 
 
+class _MouseInputBlocker(QObject):
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+            QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.MouseMove,
+            QEvent.Type.Wheel,
+        ):
+            return True
+        return super().eventFilter(watched, event)
+
+
 class GlobeMainWindow(QMainWindow):
     def __init__(
         self,
@@ -481,6 +495,7 @@ class GlobeMainWindow(QMainWindow):
         self._file_menu.addAction(settings_action)
 
         self._edit_menu = self.menuBar().addMenu("Edit")
+        self._edit_menu.aboutToShow.connect(self._sync_edit_actions)
 
         self._undo_action = QAction("Undo", self)
         self._undo_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Undo))
@@ -653,29 +668,56 @@ class GlobeMainWindow(QMainWindow):
         self.viewer.refresh_vertex_count()
         self._mark_project_metadata_dirty()
 
+    @contextmanager
+    def _grid_detail_busy(self) -> Iterator[None]:
+        application = QApplication.instance()
+        if application is None:
+            raise RuntimeError("Grid detail operations require a running application.")
+        blocker = _MouseInputBlocker()
+        was_enabled = self.isEnabled()
+        application.installEventFilter(blocker)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.setEnabled(False)
+        try:
+            QApplication.processEvents()
+            yield
+        finally:
+            try:
+                # Discard clicks queued during the operation before restoring input.
+                QApplication.processEvents()
+            finally:
+                self.setEnabled(was_enabled)
+                QApplication.restoreOverrideCursor()
+                application.removeEventFilter(blocker)
+
     @Slot()
     def add_grid_detail(self) -> None:
         mesh_grid = self.viewer.gl_widget.mesh_grid
         if mesh_grid is None:
             raise RuntimeError("Add detail requires a mesh-backed globe.")
-        if mesh_grid.subdivide_selected_faces_once() <= 0:
-            return
-        self._refresh_after_grid_detail_change()
+        with self._grid_detail_busy():
+            if mesh_grid.subdivide_selected_faces_once() <= 0:
+                return
+            self._refresh_after_grid_detail_change()
 
     @Slot()
     def remove_grid_detail(self) -> None:
         mesh_grid = self.viewer.gl_widget.mesh_grid
         if mesh_grid is None:
             raise RuntimeError("Remove detail requires a mesh-backed globe.")
-        if mesh_grid.remove_selected_lowest_level_vertices() <= 0:
-            return
-        self._refresh_after_grid_detail_change()
+        with self._grid_detail_busy():
+            if mesh_grid.remove_selected_lowest_level_vertices() <= 0:
+                return
+            self._refresh_after_grid_detail_change()
 
     def _sync_edit_actions(self) -> None:
         if self._undo_action is not None:
             self._undo_action.setEnabled(self._undo_stack.can_undo())
         if self._redo_action is not None:
             self._redo_action.setEnabled(self._undo_stack.can_redo())
+        if self._grid_menu is not None:
+            mesh_grid = self.viewer.gl_widget.mesh_grid
+            self._grid_menu.setEnabled(mesh_grid is not None and mesh_grid.has_selection)
 
     def _on_project_state_changed(self) -> None:
         self._sync_edit_actions()

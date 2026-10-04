@@ -5,9 +5,10 @@ import sys
 import numpy as np
 from PIL import Image
 import pytest
-from PySide6.QtCore import QDir, QSettings, Qt, QPointF
-from PySide6.QtGui import QColor, QCloseEvent
-from PySide6.QtWidgets import QComboBox, QFileDialog, QMessageBox, QProgressBar, QSlider, QSpinBox, QToolTip
+from PySide6.QtCore import QDir, QEvent, QSettings, Qt, QPointF
+from PySide6.QtGui import QColor, QCloseEvent, QMouseEvent
+from PySide6.QtWidgets import QComboBox, QFileDialog, QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox, QToolTip
+from PySide6.QtTest import QTest
 
 import oswald_globe.app as app_module
 from oswald_globe.app import IcosphereProgressDialog, create_window, load_elevation
@@ -1450,6 +1451,112 @@ def test_select_menu_actions_update_selection_and_support_undo(qapp):
         window._undo_stack.undo()
         np.testing.assert_allclose(selection.values, original)
     finally:
+        window.close()
+
+
+def test_grid_menu_requires_selection_and_tracks_undo_redo(qapp, tmp_path: Path):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("application/initial_grid_depth", 1)
+    window = create_window(settings=settings)
+    try:
+        grid_action = window._grid_menu.menuAction()
+        assert not grid_action.isEnabled()
+
+        window.select_all_vertices()
+        assert grid_action.isEnabled()
+        window.select_no_vertices()
+        assert not grid_action.isEnabled()
+        window._undo_stack.undo()
+        assert grid_action.isEnabled()
+        window._undo_stack.redo()
+        assert not grid_action.isEnabled()
+        window.invert_vertex_selection()
+        assert grid_action.isEnabled()
+
+        selection = window.viewer.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+        selection.values[:] = 0.0
+        window._edit_menu.aboutToShow.emit()
+        assert not grid_action.isEnabled()
+        selection.values[0] = 0.01
+        window._edit_menu.aboutToShow.emit()
+        assert grid_action.isEnabled()
+
+        window._set_heightfield(None)
+        assert not grid_action.isEnabled()
+    finally:
+        window._undo_stack.set_clean()
+        window.close()
+
+
+@pytest.mark.parametrize(
+    ("action_name", "mesh_method"),
+    [
+        ("add_grid_detail", "subdivide_selected_faces_once"),
+        ("remove_grid_detail", "remove_selected_lowest_level_vertices"),
+    ],
+)
+@pytest.mark.parametrize("outcome", ["changed", "unchanged", "error", "refresh_error"])
+def test_grid_detail_operations_block_mouse_and_restore_cursor(
+    qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action_name, mesh_method, outcome
+):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("application/initial_grid_depth", 1)
+    window = create_window(settings=settings)
+    button = QPushButton("Probe")
+    clicks = []
+    button.clicked.connect(lambda: clicks.append(True))
+    refreshed = []
+    previous_cursor = qapp.overrideCursor()
+    qapp.setOverrideCursor(Qt.CursorShape.CrossCursor)
+
+    def assert_busy():
+        assert qapp.overrideCursor().shape() == Qt.CursorShape.WaitCursor
+        assert not window.isEnabled()
+        QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+        assert clicks == []
+
+    def mutate():
+        assert_busy()
+        for event_type, buttons in (
+            (QEvent.Type.MouseButtonPress, Qt.MouseButton.LeftButton),
+            (QEvent.Type.MouseButtonRelease, Qt.MouseButton.NoButton),
+        ):
+            qapp.postEvent(
+                button,
+                QMouseEvent(
+                    event_type, QPointF(5.0, 5.0), QPointF(5.0, 5.0),
+                    Qt.MouseButton.LeftButton, buttons, Qt.KeyboardModifier.NoModifier,
+                ),
+            )
+        if outcome == "error":
+            raise RuntimeError("Mutation failed")
+        return 0 if outcome == "unchanged" else 1
+
+    def refresh():
+        assert_busy()
+        refreshed.append(True)
+        if outcome == "refresh_error":
+            raise RuntimeError("Refresh failed")
+
+    monkeypatch.setattr(window.viewer.mesh_grid, mesh_method, mutate)
+    monkeypatch.setattr(window, "_refresh_after_grid_detail_change", refresh)
+    try:
+        if outcome in ("error", "refresh_error"):
+            with pytest.raises(RuntimeError, match="failed"):
+                getattr(window, action_name)()
+        else:
+            getattr(window, action_name)()
+        assert window.isEnabled()
+        assert qapp.overrideCursor().shape() == Qt.CursorShape.CrossCursor
+        assert bool(refreshed) == (outcome in ("changed", "refresh_error"))
+        qapp.processEvents()
+        assert clicks == []
+        QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+        assert clicks == [True]
+    finally:
+        qapp.restoreOverrideCursor()
+        assert qapp.overrideCursor() == previous_cursor
+        button.close()
         window.close()
 
 

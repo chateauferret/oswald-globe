@@ -40,6 +40,105 @@ def test_subdivide_selected_faces_once_refines_selected_triangles():
     assert subdivided_faces == 20 * 4
     assert grid.face_count() == 20 * 4 ** 2
     assert grid.vertex_count() == 10 * (4 ** 2) + 2
+    degrees = np.array([len(neighbors) for neighbors in grid.build_adjacency().values()])
+    assert np.count_nonzero(degrees == 5) == 12
+    assert np.all((degrees == 5) | (degrees == 6))
+
+
+def test_repeated_local_subdivision_stays_balanced_and_manifold():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(2)
+    original_faces = list(grid._red_leaves())
+    grid.get_layer(grid.SELECTION_LAYER_NAME).values[list(original_faces[0].v)] = 1.0
+    grid.add_layer("constant", np.full(grid.vertex_count(), 42.0))
+    grid.dual_cell_line_segments()
+
+    for _ in range(4):
+        assert grid.subdivide_selected_faces_once() > 0
+        edge_counts: dict[tuple[int, int], int] = {}
+        for face in grid.leaf_faces():
+            a, b, c = face.v
+            for edge in ((a, b), (b, c), (c, a)):
+                key = tuple(sorted(edge))
+                edge_counts[key] = edge_counts.get(key, 0) + 1
+        assert set(edge_counts.values()) == {2}
+        assert grid.vertex_count() - len(edge_counts) + grid.face_count() == 2
+        for face in grid._red_leaves():
+            a, b, c = face.v
+            assert all(grid._far_side_depth(i, j) <= 1 for i, j in ((a, b), (b, c), (c, a)))
+        _, ranges = grid.dual_cell_line_segments()
+        assert np.all((ranges[:, 1] // 2 >= 5) & (ranges[:, 1] // 2 <= 8))
+        assert max(map(len, grid.build_adjacency().values())) <= 8
+        np.testing.assert_allclose(grid.get_layer("constant").values, 42.0)
+
+    assert any(face.is_leaf for face in original_faces)
+
+
+def test_local_subdivision_refines_overcrowded_transition_cells():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(2)
+    selection = grid.get_layer(grid.SELECTION_LAYER_NAME)
+    selection.values[:] = 1.0
+    selection.values[grid._red_leaves()[0].v[0]] = 0.0
+
+    grid.subdivide_selected_faces_once()
+
+    assert max(map(len, grid.build_adjacency().values())) <= 8
+    _, ranges = grid.dual_cell_line_segments()
+    assert np.all(ranges[:, 1] // 2 <= 8)
+
+
+def test_local_subdivision_uses_shared_spherical_edge_midpoints():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(1)
+    face = grid._red_leaves()[0]
+    grid.get_layer(grid.SELECTION_LAYER_NAME).values[list(face.v)] = (0.25, 0.5, 1.0)
+    grid.add_layer("temperature", np.arange(grid.vertex_count(), dtype=np.float64))
+    original_values = {name: grid.get_layer(name).values.copy() for name in grid.layer_names()}
+
+    grid.subdivide_selected_faces_once()
+
+    a, b, c = grid._face_child_midpoints(face)
+    v0, v1, v2 = face.v
+    assert [child.v for child in face.children] == [
+        (v0, a, c), (a, v1, b), (c, b, v2), (a, b, c)
+    ]
+    for midpoint, (i, j) in zip((a, b, c), ((v0, v1), (v1, v2), (v2, v0))):
+        expected = grid.vertices[i] + grid.vertices[j]
+        expected /= np.linalg.norm(expected)
+        np.testing.assert_allclose(grid.vertices[midpoint], expected)
+        assert grid._edge_midpoints[tuple(sorted((i, j)))] == midpoint
+        for name in ("temperature", grid.SELECTION_LAYER_NAME):
+            assert grid.get_layer(name).values[midpoint] == (original_values[name][i] + original_values[name][j]) / 2.0
+    for name, values in original_values.items():
+        np.testing.assert_array_equal(grid.get_layer(name).values[:len(values)], values)
+
+
+def test_local_subdivision_preserves_existing_midpoint_layer_values():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(1)
+    face = grid._red_leaves()[0]
+    grid.get_layer(grid.SELECTION_LAYER_NAME).values[list(face.v)] = 1.0
+    grid.subdivide_selected_faces_once()
+    midpoint = grid._face_child_midpoints(face)[0]
+    grid.get_layer("elevation").values[midpoint] = 123.0
+    grid.get_layer(grid.SELECTION_LAYER_NAME).values[:] = 1.0
+
+    grid.subdivide_selected_faces_once()
+
+    assert grid.get_layer("elevation").values[midpoint] == 123.0
+
+
+def test_local_subdivision_without_selection_does_not_change_mesh():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(1)
+    vertices = grid.vertices.copy()
+    faces = [face.v for face in grid.leaf_faces()]
+
+    assert grid.subdivide_selected_faces_once() == 0
+
+    np.testing.assert_array_equal(grid.vertices, vertices)
+    assert [face.v for face in grid.leaf_faces()] == faces
 
 
 def test_remove_selected_lowest_level_vertices_coarsens_selected_detail():
