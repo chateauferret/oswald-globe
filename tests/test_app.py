@@ -57,6 +57,48 @@ def test_create_window_defaults_to_empty_sea_level_globe(qapp):
         window.close()
 
 
+def test_memory_statusbar_reports_process_usage_and_safe_maximum(qapp, tmp_path: Path, monkeypatch):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(
+        globe_main_window,
+        "_get_memory_usage_bytes",
+        lambda: (512 * 1024**2, 8 * 1024**3),
+    )
+    window = create_window(settings=settings)
+    try:
+        assert window._memory_status_label.text() == (
+            "Memory: 512.0 MiB / 6.0 GiB safe maximum (75% of RAM)"
+        )
+        assert window._memory_status_label.parent() is window.statusBar()
+        assert window._memory_refresh_timer.interval() == 1000
+    finally:
+        window.close()
+
+
+def test_undo_and_redo_refresh_memory_status(qapp, tmp_path: Path, monkeypatch):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    window = create_window(settings=settings)
+    refreshes = []
+    monkeypatch.setattr(window, "_refresh_memory_status", lambda: refreshes.append(True))
+
+    class DummyCommand:
+        def redo(self) -> None:
+            pass
+
+        def undo(self) -> None:
+            pass
+
+    try:
+        window._undo_stack.push(DummyCommand())
+        window._undo_stack.undo()
+        window._undo_stack.redo()
+
+        assert len(refreshes) == 3
+    finally:
+        window._mark_project_clean()
+        window.close()
+
+
 def test_settings_dialog_has_application_tab(qapp):
     window = create_window()
     try:
@@ -1540,6 +1582,8 @@ def test_grid_detail_operations_block_mouse_and_restore_cursor(
 
     monkeypatch.setattr(window.viewer.mesh_grid, mesh_method, mutate)
     monkeypatch.setattr(window, "_refresh_after_grid_detail_change", refresh)
+    memory_refreshed = []
+    monkeypatch.setattr(window, "_refresh_memory_status", lambda: memory_refreshed.append(True))
     try:
         if outcome in ("error", "refresh_error"):
             with pytest.raises(RuntimeError, match="failed"):
@@ -1549,6 +1593,7 @@ def test_grid_detail_operations_block_mouse_and_restore_cursor(
         assert window.isEnabled()
         assert qapp.overrideCursor().shape() == Qt.CursorShape.CrossCursor
         assert bool(refreshed) == (outcome in ("changed", "refresh_error"))
+        assert memory_refreshed == [True]
         qapp.processEvents()
         assert clicks == []
         QTest.mouseClick(button, Qt.MouseButton.LeftButton)

@@ -14,6 +14,7 @@ to rasterize mesh data back onto a regular lat/lon grid.
 
 from __future__ import annotations
 
+import gc
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -415,6 +416,7 @@ class IcosphereGrid:
         kept_indices = sorted(used_vertex_indices)
         index_map = {old_index: new_index for new_index, old_index in enumerate(kept_indices)}
         self._vertices = [self._vertices[index] for index in kept_indices]
+        gc.collect()
 
         for layer_name in self.layer_names():
             layer = self._layers[layer_name]

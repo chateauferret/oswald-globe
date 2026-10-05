@@ -8,9 +8,10 @@ import sys
 from contextlib import contextmanager
 from threading import Event
 from pathlib import Path
-from typing import Dict, Iterator, Optional, Union
+from typing import Dict, Iterator, Optional, Tuple, Union
 from PySide6.QtCore import QSize
 import numpy as np
+import psutil
 from PIL import Image
 from PySide6.QtCore import QDir, QEvent, QObject, QSettings, QThread, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QIcon, QKeySequence, QLinearGradient, QPainter, QPixmap, QSurfaceFormat
@@ -27,6 +28,26 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+def _get_memory_usage_bytes() -> Tuple[int, int]:
+    """Return this process's resident memory and total physical RAM in bytes."""
+    process_memory = psutil.Process().memory_info().rss
+    total_memory = psutil.virtual_memory().total
+    return process_memory, total_memory
+
+
+def _format_memory_size(byte_count: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    size = float(byte_count)
+    for unit in units[:-1]:
+        if size < 1024.0:
+            break
+        size /= 1024.0
+    else:
+        unit = units[-1]
+    return f"{size:.1f} {unit}"
+
 
 try:
     import rasterio
@@ -444,6 +465,15 @@ class GlobeMainWindow(QMainWindow):
         self._pending_viewer: Optional[GlobeViewer] = None
         self._heightfield: Optional[Path] = None
 
+        self._memory_status_label = QLabel(self)
+        self._memory_status_label.setObjectName("MemoryUsageLabel")
+        self.statusBar().addPermanentWidget(self._memory_status_label)
+        self._memory_refresh_timer = QTimer(self)
+        self._memory_refresh_timer.setInterval(1000)
+        self._memory_refresh_timer.timeout.connect(self._refresh_memory_status)
+        self._memory_refresh_timer.start()
+        self._refresh_memory_status()
+
         self._set_heightfield(heightfield)
         self.resize(width, height)
         self.setMinimumSize(480, 540)
@@ -695,20 +725,34 @@ class GlobeMainWindow(QMainWindow):
         mesh_grid = self.viewer.gl_widget.mesh_grid
         if mesh_grid is None:
             raise RuntimeError("Add detail requires a mesh-backed globe.")
-        with self._grid_detail_busy():
-            if mesh_grid.subdivide_selected_faces_once() <= 0:
-                return
-            self._refresh_after_grid_detail_change()
+        try:
+            with self._grid_detail_busy():
+                if mesh_grid.subdivide_selected_faces_once() <= 0:
+                    return
+                self._refresh_after_grid_detail_change()
+        finally:
+            self._refresh_memory_status()
 
     @Slot()
     def remove_grid_detail(self) -> None:
         mesh_grid = self.viewer.gl_widget.mesh_grid
         if mesh_grid is None:
             raise RuntimeError("Remove detail requires a mesh-backed globe.")
-        with self._grid_detail_busy():
-            if mesh_grid.remove_selected_lowest_level_vertices() <= 0:
-                return
-            self._refresh_after_grid_detail_change()
+        try:
+            with self._grid_detail_busy():
+                if mesh_grid.remove_selected_lowest_level_vertices() <= 0:
+                    return
+                self._refresh_after_grid_detail_change()
+        finally:
+            self._refresh_memory_status()
+
+    def _refresh_memory_status(self) -> None:
+        process_memory, total_memory = _get_memory_usage_bytes()
+        safe_maximum = total_memory * 3 // 4
+        self._memory_status_label.setText(
+            f"Memory: {_format_memory_size(process_memory)} / "
+            f"{_format_memory_size(safe_maximum)} safe maximum (75% of RAM)"
+        )
 
     def _sync_edit_actions(self) -> None:
         if self._undo_action is not None:
@@ -722,6 +766,7 @@ class GlobeMainWindow(QMainWindow):
     def _on_project_state_changed(self) -> None:
         self._sync_edit_actions()
         self.setWindowModified(self._has_unsaved_changes())
+        self._refresh_memory_status()
 
     def _has_unsaved_changes(self) -> bool:
         return not self._undo_stack.is_clean() or self._project_metadata_dirty
