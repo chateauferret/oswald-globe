@@ -5,6 +5,8 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$PROJECT_ROOT/.venv"
 REQUIREMENTS="$PROJECT_ROOT/requirements.txt"
 REQUIREMENTS_HASH_FILE="$VENV_DIR/.requirements.sha256"
+PYPROJECT="$PROJECT_ROOT/pyproject.toml"
+PYPROJECT_HASH_FILE="$VENV_DIR/.pyproject.sha256"
 LOG_DIR="$PROJECT_ROOT/.logs"
 LOG_FILE="$LOG_DIR/launch.log"
 
@@ -21,6 +23,17 @@ fi
 if [[ "$requirements_hash" != "$installed_hash" ]]; then
     "$VENV_DIR/bin/python" -m pip install --requirement "$REQUIREMENTS"
     printf '%s\n' "$requirements_hash" > "$REQUIREMENTS_HASH_FILE"
+fi
+
+pyproject_hash="$(sha256sum "$PYPROJECT" | awk '{print $1}')"
+installed_pyproject_hash=""
+if [[ -f "$PYPROJECT_HASH_FILE" ]]; then
+    installed_pyproject_hash="$(<"$PYPROJECT_HASH_FILE")"
+fi
+
+if [[ "$pyproject_hash" != "$installed_pyproject_hash" ]]; then
+    "$VENV_DIR/bin/python" -m pip install --editable "$PROJECT_ROOT"
+    printf '%s\n' "$pyproject_hash" > "$PYPROJECT_HASH_FILE"
 fi
 
 # Activate for the application and any subprocesses it starts.

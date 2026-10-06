@@ -1496,6 +1496,84 @@ def test_select_menu_actions_update_selection_and_support_undo(qapp):
         window.close()
 
 
+def test_select_by_value_without_existing_selection_selects_globally_and_undoes(qapp):
+    window = create_window()
+    try:
+        mesh_grid = window.viewer.mesh_grid
+        assert mesh_grid is not None
+        selection = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+        selection.values[:] = 0.0
+        elevation = mesh_grid.get_layer("elevation")
+        elevation.values[:] = np.linspace(-32767.0, 32767.0, mesh_grid.vertex_count(), dtype=np.float64)
+
+        expected = ((elevation.values >= -1024.0) & (elevation.values <= 1024.0)).astype(np.float64)
+        window.select_vertices_by_value_range(-1024.0, 1024.0)
+        np.testing.assert_allclose(selection.values, expected)
+
+        window._undo_stack.undo()
+        np.testing.assert_allclose(selection.values, 0.0)
+    finally:
+        window.close()
+
+
+def test_select_by_value_with_existing_selection_only_filters_selected_vertices(qapp):
+    window = create_window()
+    try:
+        mesh_grid = window.viewer.mesh_grid
+        assert mesh_grid is not None
+        selection = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+        selection.values[:] = 0.0
+        selected_indices = np.array([0, 1, 2, 3], dtype=np.intp)
+        selection.values[selected_indices] = np.array([0.2, 0.4, 0.6, 0.8], dtype=np.float64)
+
+        elevation = mesh_grid.get_layer("elevation")
+        elevation.values[:] = 9999.0
+        elevation.values[0] = -2000.0
+        elevation.values[1] = -500.0
+        elevation.values[2] = 500.0
+        elevation.values[3] = 2000.0
+        unselected_in_range_index = 4
+        elevation.values[unselected_in_range_index] = 100.0
+
+        before = selection.values.copy()
+        window.select_vertices_by_value_range(-1000.0, 1000.0)
+
+        expected = np.zeros_like(before)
+        expected[1] = 1.0
+        expected[2] = 1.0
+        np.testing.assert_allclose(selection.values, expected)
+        assert selection.values[unselected_in_range_index] == 0.0
+
+        window._undo_stack.undo()
+        np.testing.assert_allclose(selection.values, before)
+    finally:
+        window.close()
+
+
+def test_select_by_value_dialog_cancel_is_noop(qapp, monkeypatch: pytest.MonkeyPatch):
+    window = create_window()
+    try:
+        mesh_grid = window.viewer.mesh_grid
+        assert mesh_grid is not None
+        selection = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
+        before = selection.values.copy()
+
+        class CancelDialog:
+            def __init__(self, _parent):
+                pass
+
+            def exec(self):
+                return QFileDialog.DialogCode.Rejected
+
+        monkeypatch.setattr(globe_main_window, "SelectByValueDialog", CancelDialog)
+        window.select_vertices_by_value_dialog()
+
+        np.testing.assert_allclose(selection.values, before)
+        assert not window._undo_stack.can_undo()
+    finally:
+        window.close()
+
+
 def test_grid_menu_requires_selection_and_tracks_undo_redo(qapp, tmp_path: Path):
     settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     settings.setValue("application/initial_grid_depth", 1)

@@ -27,16 +27,18 @@ pentagons; local refinement cannot preserve that topology everywhere.
 ## Installation
 
 The `run.sh` script creates the local `.venv` when needed, installs the
-dependencies from `requirements.txt`, activates the environment, and starts
-the application:
+dependencies from `requirements.txt`, refreshes the project install from
+`pyproject.toml` when it changes, activates the environment, and starts the
+application:
 
 ```bash
 ./run.sh
 ```
 
-Dependencies are checked against `requirements.txt` on each start and are
-refreshed automatically when that file changes. To set up the environment
-without starting the application, run:
+Dependencies are checked against both `requirements.txt` and
+`pyproject.toml` on each start and are refreshed automatically when either
+file changes. To set up the environment without starting the application,
+run:
 
 ```bash
 python3 -m venv .venv

@@ -16,15 +16,19 @@ from PIL import Image
 from PySide6.QtCore import QDir, QEvent, QObject, QSettings, QThread, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QIcon, QKeySequence, QLinearGradient, QPainter, QPixmap, QSurfaceFormat
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QGridLayout,
     QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
     QProgressBar,
+    QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -398,6 +402,83 @@ class TiffImportProgressDialog(QDialog):
         self.setWindowTitle("Cancelling TIFF Import")
 
 
+class SelectByValueDialog(QDialog):
+    class _SliderBoundSpinBox(QSpinBox):
+        def __init__(self, slider: QSlider, parent: Optional[QWidget] = None):
+            super().__init__(parent)
+            self._slider = slider
+            self.setRange(slider.minimum(), slider.maximum())
+            self.setSingleStep(256)
+            self.setAlignment(Qt.AlignmentFlag.AlignRight)
+            self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+            self.setKeyboardTracking(False)
+            self.setValue(slider.value())
+
+            slider.valueChanged.connect(self.setValue)
+            self.valueChanged.connect(slider.setValue)
+
+        def interpretText(self) -> None:
+            editor = self.lineEdit()
+            if editor is None:
+                return
+            text = editor.text().strip()
+            if text in {"", "+", "-"}:
+                editor.setText(self.textFromValue(self.value()))
+                return
+            try:
+                value = int(text)
+            except ValueError:
+                editor.setText(self.textFromValue(self.value()))
+                return
+            if self.minimum() <= value <= self.maximum():
+                self.setValue(value)
+            else:
+                editor.setText(self.textFromValue(self.value()))
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Select by value")
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        self._minimum_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._minimum_slider.setRange(-32767, 32767)
+        self._minimum_slider.setValue(-32767)
+        self._minimum_spin = self._SliderBoundSpinBox(self._minimum_slider, self)
+
+        self._maximum_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._maximum_slider.setRange(-32767, 32767)
+        self._maximum_slider.setValue(32767)
+        self._maximum_spin = self._SliderBoundSpinBox(self._maximum_slider, self)
+
+        controls = QGridLayout()
+        controls.setHorizontalSpacing(12)
+        controls.setVerticalSpacing(8)
+        controls.addWidget(QLabel("Between", self), 0, 0)
+        controls.addWidget(self._minimum_slider, 0, 1)
+        controls.addWidget(self._minimum_spin, 0, 2)
+        controls.addWidget(QLabel("and", self), 1, 0)
+        controls.addWidget(self._maximum_slider, 1, 1)
+        controls.addWidget(self._maximum_spin, 1, 2)
+        controls.setColumnStretch(1, 1)
+
+        buttons = QDialogButtonBox(self)
+        self._ok_button = buttons.addButton("OK", QDialogButtonBox.ButtonRole.AcceptRole)
+        self._cancel_button = buttons.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        self._ok_button.clicked.connect(self.accept)
+        self._cancel_button.clicked.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(controls)
+        layout.addWidget(buttons)
+
+    def value_range(self) -> Tuple[int, int]:
+        first = int(self._minimum_slider.value())
+        second = int(self._maximum_slider.value())
+        return min(first, second), max(first, second)
+
+
 class _MouseInputBlocker(QObject):
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if event.type() in (
@@ -443,6 +524,7 @@ class GlobeMainWindow(QMainWindow):
         self._edit_menu: Optional[QMenu] = None
         self._grid_menu: Optional[QMenu] = None
         self._select_menu: Optional[QMenu] = None
+        self._select_by_value_menu: Optional[QMenu] = None
         self._undo_action: Optional[QAction] = None
         self._redo_action: Optional[QAction] = None
         self._tools_menu: Optional[QMenu] = None
@@ -560,6 +642,11 @@ class GlobeMainWindow(QMainWindow):
         select_invert_action = QAction("Invert", self)
         select_invert_action.triggered.connect(self.invert_vertex_selection)
         self._select_menu.addAction(select_invert_action)
+
+        self._select_by_value_menu = self._select_menu.addMenu("By value")
+        select_by_value_action = QAction("Range...", self)
+        select_by_value_action.triggered.connect(self.select_vertices_by_value_dialog)
+        self._select_by_value_menu.addAction(select_by_value_action)
 
         self._tools_menu = self.menuBar().addMenu("Tools")
         self._tool_action_group = QActionGroup(self._tools_menu)
@@ -691,6 +778,42 @@ class GlobeMainWindow(QMainWindow):
             raise RuntimeError("Invert Selection requires a mesh-backed globe.")
         selection_values = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values
         command = self._create_selection_layer_command(1.0 - selection_values)
+        self._undo_stack.push(command)
+
+    @staticmethod
+    def _selection_values_by_data_range(mesh_grid: IcosphereGrid, minimum: float, maximum: float) -> np.ndarray:
+        lower = float(min(minimum, maximum))
+        upper = float(max(minimum, maximum))
+        data_values = mesh_grid.get_layer("elevation").values
+        in_range = np.isfinite(data_values) & (data_values >= lower) & (data_values <= upper)
+        selection_values = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values
+        currently_selected = selection_values > 0.0
+
+        after_values = np.zeros(mesh_grid.vertex_count(), dtype=np.float64)
+        if np.any(currently_selected):
+            after_values[currently_selected & in_range] = 1.0
+            return after_values
+        after_values[in_range] = 1.0
+        return after_values
+
+    @Slot()
+    def select_vertices_by_value_dialog(self) -> None:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Select by value requires a mesh-backed globe.")
+        dialog = SelectByValueDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        minimum, maximum = dialog.value_range()
+        self.select_vertices_by_value_range(minimum, maximum)
+
+    def select_vertices_by_value_range(self, minimum: float, maximum: float) -> None:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Select by value requires a mesh-backed globe.")
+        command = self._create_selection_layer_command(
+            self._selection_values_by_data_range(mesh_grid, minimum, maximum)
+        )
         self._undo_stack.push(command)
 
     def _refresh_after_grid_detail_change(self) -> None:
