@@ -5,27 +5,53 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from contextlib import contextmanager
 from threading import Event
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Dict, Iterator, Optional, Tuple, Union
 from PySide6.QtCore import QSize
 import numpy as np
+import psutil
 from PIL import Image
-from PySide6.QtCore import QDir, QObject, QSettings, QThread, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QDir, QEvent, QObject, QSettings, QThread, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QIcon, QKeySequence, QLinearGradient, QPainter, QPixmap, QSurfaceFormat
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QGridLayout,
     QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
     QProgressBar,
+    QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
+
+
+def _get_memory_usage_bytes() -> Tuple[int, int]:
+    """Return this process's resident memory and total physical RAM in bytes."""
+    process_memory = psutil.Process().memory_info().rss
+    total_memory = psutil.virtual_memory().total
+    return process_memory, total_memory
+
+
+def _format_memory_size(byte_count: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    size = float(byte_count)
+    for unit in units[:-1]:
+        if size < 1024.0:
+            break
+        size /= 1024.0
+    else:
+        unit = units[-1]
+    return f"{size:.1f} {unit}"
+
 
 try:
     import rasterio
@@ -51,7 +77,6 @@ try:
     from .settings_dialog import SettingsDialog
     from .undo_stack import BrushPaintCommand, SelectionBrushCommand, SelectionLayerCommand, UndoStack
 except ImportError:  # pragma: no cover - supports running as a script
-
     from oswald_globe import resources_rc  # noqa: F401
     from oswald_globe.app_support import APP_SETTINGS, DEFAULT_HEIGHTFIELD, empty_globe_elevation, generic_icosphere_mesh, load_elevation
     from oswald_globe.colormap import DEFAULT_TOPO_LEGEND, LEGENDS_DIR, load_topo_cmap
@@ -377,6 +402,96 @@ class TiffImportProgressDialog(QDialog):
         self.setWindowTitle("Cancelling TIFF Import")
 
 
+class SelectByValueDialog(QDialog):
+    class _SliderBoundSpinBox(QSpinBox):
+        def __init__(self, slider: QSlider, parent: Optional[QWidget] = None):
+            super().__init__(parent)
+            self._slider = slider
+            self.setRange(slider.minimum(), slider.maximum())
+            self.setSingleStep(256)
+            self.setAlignment(Qt.AlignmentFlag.AlignRight)
+            self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+            self.setKeyboardTracking(False)
+            self.setValue(slider.value())
+
+            slider.valueChanged.connect(self.setValue)
+            self.valueChanged.connect(slider.setValue)
+
+        def interpretText(self) -> None:
+            editor = self.lineEdit()
+            if editor is None:
+                return
+            text = editor.text().strip()
+            if text in {"", "+", "-"}:
+                editor.setText(self.textFromValue(self.value()))
+                return
+            try:
+                value = int(text)
+            except ValueError:
+                editor.setText(self.textFromValue(self.value()))
+                return
+            if self.minimum() <= value <= self.maximum():
+                self.setValue(value)
+            else:
+                editor.setText(self.textFromValue(self.value()))
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Select by value")
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        self._minimum_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._minimum_slider.setRange(-32767, 32767)
+        self._minimum_slider.setValue(-32767)
+        self._minimum_spin = self._SliderBoundSpinBox(self._minimum_slider, self)
+
+        self._maximum_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._maximum_slider.setRange(-32767, 32767)
+        self._maximum_slider.setValue(32767)
+        self._maximum_spin = self._SliderBoundSpinBox(self._maximum_slider, self)
+
+        controls = QGridLayout()
+        controls.setHorizontalSpacing(12)
+        controls.setVerticalSpacing(8)
+        controls.addWidget(QLabel("Between", self), 0, 0)
+        controls.addWidget(self._minimum_slider, 0, 1)
+        controls.addWidget(self._minimum_spin, 0, 2)
+        controls.addWidget(QLabel("and", self), 1, 0)
+        controls.addWidget(self._maximum_slider, 1, 1)
+        controls.addWidget(self._maximum_spin, 1, 2)
+        controls.setColumnStretch(1, 1)
+
+        buttons = QDialogButtonBox(self)
+        self._ok_button = buttons.addButton("OK", QDialogButtonBox.ButtonRole.AcceptRole)
+        self._cancel_button = buttons.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        self._ok_button.clicked.connect(self.accept)
+        self._cancel_button.clicked.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(controls)
+        layout.addWidget(buttons)
+
+    def value_range(self) -> Tuple[int, int]:
+        first = int(self._minimum_slider.value())
+        second = int(self._maximum_slider.value())
+        return min(first, second), max(first, second)
+
+
+class _MouseInputBlocker(QObject):
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+            QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.MouseMove,
+            QEvent.Type.Wheel,
+        ):
+            return True
+        return super().eventFilter(watched, event)
+
+
 class GlobeMainWindow(QMainWindow):
     def __init__(
         self,
@@ -392,10 +507,11 @@ class GlobeMainWindow(QMainWindow):
         self._mesh_min_level = mesh_min_level
         self._mesh_max_level = mesh_max_level
         self._mesh_threshold = mesh_threshold
+        self._settings = settings or APP_SETTINGS
+        self._initial_grid_depth = self._read_initial_grid_depth_setting()
         self._project_metadata_dirty = False
         self._save_path: Optional[Path] = None
         self._export_path: Optional[Path] = None
-        self._settings = settings or APP_SETTINGS
         self._legend_action_group: Optional[QActionGroup] = None
         self._tool_action_group: Optional[QActionGroup] = None
         self._filter_action_group: Optional[QActionGroup] = None
@@ -406,7 +522,9 @@ class GlobeMainWindow(QMainWindow):
         self._active_tool_name: Optional[str] = None
         self._file_menu: Optional[QMenu] = None
         self._edit_menu: Optional[QMenu] = None
+        self._grid_menu: Optional[QMenu] = None
         self._select_menu: Optional[QMenu] = None
+        self._select_by_value_menu: Optional[QMenu] = None
         self._undo_action: Optional[QAction] = None
         self._redo_action: Optional[QAction] = None
         self._tools_menu: Optional[QMenu] = None
@@ -428,6 +546,15 @@ class GlobeMainWindow(QMainWindow):
         self._pending_elevation: Optional[np.ndarray] = None
         self._pending_viewer: Optional[GlobeViewer] = None
         self._heightfield: Optional[Path] = None
+
+        self._memory_status_label = QLabel(self)
+        self._memory_status_label.setObjectName("MemoryUsageLabel")
+        self.statusBar().addPermanentWidget(self._memory_status_label)
+        self._memory_refresh_timer = QTimer(self)
+        self._memory_refresh_timer.setInterval(1000)
+        self._memory_refresh_timer.timeout.connect(self._refresh_memory_status)
+        self._memory_refresh_timer.start()
+        self._refresh_memory_status()
 
         self._set_heightfield(heightfield)
         self.resize(width, height)
@@ -480,6 +607,7 @@ class GlobeMainWindow(QMainWindow):
         self._file_menu.addAction(settings_action)
 
         self._edit_menu = self.menuBar().addMenu("Edit")
+        self._edit_menu.aboutToShow.connect(self._sync_edit_actions)
 
         self._undo_action = QAction("Undo", self)
         self._undo_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Undo))
@@ -490,6 +618,16 @@ class GlobeMainWindow(QMainWindow):
         self._redo_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Redo))
         self._redo_action.triggered.connect(self._undo_stack.redo)
         self._edit_menu.addAction(self._redo_action)
+
+        self._grid_menu = self._edit_menu.addMenu("Grid")
+
+        add_detail_action = QAction("Add detail", self)
+        add_detail_action.triggered.connect(self.add_grid_detail)
+        self._grid_menu.addAction(add_detail_action)
+
+        remove_detail_action = QAction("Remove detail", self)
+        remove_detail_action.triggered.connect(self.remove_grid_detail)
+        self._grid_menu.addAction(remove_detail_action)
 
         self._select_menu = self.menuBar().addMenu("Select")
 
@@ -504,6 +642,11 @@ class GlobeMainWindow(QMainWindow):
         select_invert_action = QAction("Invert", self)
         select_invert_action.triggered.connect(self.invert_vertex_selection)
         self._select_menu.addAction(select_invert_action)
+
+        self._select_by_value_menu = self._select_menu.addMenu("By value")
+        select_by_value_action = QAction("Range...", self)
+        select_by_value_action.triggered.connect(self.select_vertices_by_value_dialog)
+        self._select_by_value_menu.addAction(select_by_value_action)
 
         self._tools_menu = self.menuBar().addMenu("Tools")
         self._tool_action_group = QActionGroup(self._tools_menu)
@@ -637,15 +780,116 @@ class GlobeMainWindow(QMainWindow):
         command = self._create_selection_layer_command(1.0 - selection_values)
         self._undo_stack.push(command)
 
+    @staticmethod
+    def _selection_values_by_data_range(mesh_grid: IcosphereGrid, minimum: float, maximum: float) -> np.ndarray:
+        lower = float(min(minimum, maximum))
+        upper = float(max(minimum, maximum))
+        data_values = mesh_grid.get_layer("elevation").values
+        in_range = np.isfinite(data_values) & (data_values >= lower) & (data_values <= upper)
+        selection_values = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values
+        currently_selected = selection_values > 0.0
+
+        after_values = np.zeros(mesh_grid.vertex_count(), dtype=np.float64)
+        if np.any(currently_selected):
+            after_values[currently_selected & in_range] = 1.0
+            return after_values
+        after_values[in_range] = 1.0
+        return after_values
+
+    @Slot()
+    def select_vertices_by_value_dialog(self) -> None:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Select by value requires a mesh-backed globe.")
+        dialog = SelectByValueDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        minimum, maximum = dialog.value_range()
+        self.select_vertices_by_value_range(minimum, maximum)
+
+    def select_vertices_by_value_range(self, minimum: float, maximum: float) -> None:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Select by value requires a mesh-backed globe.")
+        command = self._create_selection_layer_command(
+            self._selection_values_by_data_range(mesh_grid, minimum, maximum)
+        )
+        self._undo_stack.push(command)
+
+    def _refresh_after_grid_detail_change(self) -> None:
+        self.viewer.gl_widget.rebuild_mesh_geometry()
+        self.viewer.refresh_vertex_count()
+        self._mark_project_metadata_dirty()
+
+    @contextmanager
+    def _grid_detail_busy(self) -> Iterator[None]:
+        application = QApplication.instance()
+        if application is None:
+            raise RuntimeError("Grid detail operations require a running application.")
+        blocker = _MouseInputBlocker()
+        was_enabled = self.isEnabled()
+        application.installEventFilter(blocker)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.setEnabled(False)
+        try:
+            QApplication.processEvents()
+            yield
+        finally:
+            try:
+                # Discard clicks queued during the operation before restoring input.
+                QApplication.processEvents()
+            finally:
+                self.setEnabled(was_enabled)
+                QApplication.restoreOverrideCursor()
+                application.removeEventFilter(blocker)
+
+    @Slot()
+    def add_grid_detail(self) -> None:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Add detail requires a mesh-backed globe.")
+        try:
+            with self._grid_detail_busy():
+                if mesh_grid.subdivide_selected_faces_once() <= 0:
+                    return
+                self._refresh_after_grid_detail_change()
+        finally:
+            self._refresh_memory_status()
+
+    @Slot()
+    def remove_grid_detail(self) -> None:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Remove detail requires a mesh-backed globe.")
+        try:
+            with self._grid_detail_busy():
+                if mesh_grid.remove_selected_lowest_level_vertices() <= 0:
+                    return
+                self._refresh_after_grid_detail_change()
+        finally:
+            self._refresh_memory_status()
+
+    def _refresh_memory_status(self) -> None:
+        process_memory, total_memory = _get_memory_usage_bytes()
+        safe_maximum = total_memory * 3 // 4
+        self._memory_status_label.setText(
+            f"Memory: {_format_memory_size(process_memory)} / "
+            f"{_format_memory_size(safe_maximum)} safe maximum (75% of RAM)"
+        )
+
     def _sync_edit_actions(self) -> None:
         if self._undo_action is not None:
             self._undo_action.setEnabled(self._undo_stack.can_undo())
         if self._redo_action is not None:
             self._redo_action.setEnabled(self._undo_stack.can_redo())
+        if self._grid_menu is not None:
+            mesh_grid = self.viewer.gl_widget.mesh_grid
+            self._grid_menu.setEnabled(mesh_grid is not None and mesh_grid.has_selection)
 
     def _on_project_state_changed(self) -> None:
         self._sync_edit_actions()
         self.setWindowModified(self._has_unsaved_changes())
+        self._refresh_memory_status()
 
     def _has_unsaved_changes(self) -> bool:
         return not self._undo_stack.is_clean() or self._project_metadata_dirty
@@ -783,6 +1027,7 @@ class GlobeMainWindow(QMainWindow):
     def new_project(self) -> None:
         if not self._confirm_discard_or_save_changes("starting a new project"):
             return
+        self._initial_grid_depth = self._read_initial_grid_depth_setting()
         self._set_heightfield(None)
 
     def _start_heightfield_load(self, heightfield: Path, elevation: np.ndarray) -> None:
@@ -1017,6 +1262,22 @@ class GlobeMainWindow(QMainWindow):
             self._export_thread = None
         self._pending_export_path = None
 
+    def _ensure_application_settings_defaults(self) -> None:
+        if self._settings.value("application/initial_grid_depth") is None:
+            self._settings.setValue("application/initial_grid_depth", 6)
+        if self._settings.value("application/maximum_vertex_count") is None:
+            self._settings.setValue("application/maximum_vertex_count", 1_000_000)
+        self._settings.sync()
+
+    def _read_initial_grid_depth_setting(self) -> int:
+        self._ensure_application_settings_defaults()
+        value = self._settings.value("application/initial_grid_depth", 6)
+        try:
+            depth = int(value)
+        except (TypeError, ValueError):
+            depth = 6
+        return max(4, min(8, depth))
+
     def _set_heightfield(
         self,
         heightfield: Optional[Path],
@@ -1032,7 +1293,7 @@ class GlobeMainWindow(QMainWindow):
         if heightfield is None:
             elevation_data = empty_globe_elevation() if elevation is None else np.asarray(elevation, dtype=np.float32)
             view_title = "Sea level"
-            mesh = mesh_grid if mesh_grid is not None else generic_icosphere_mesh(self._mesh_max_level)
+            mesh = mesh_grid if mesh_grid is not None else generic_icosphere_mesh(self._initial_grid_depth)
             viewer = GlobeViewer(
                 elevation_data,
                 cmap=load_topo_cmap(self._ensure_current_legend(), name=self._legend_name(self._current_legend)),
@@ -1177,12 +1438,21 @@ class GlobeMainWindow(QMainWindow):
         )
 
     def open_settings(self) -> None:
-        dialog = SettingsDialog(self.viewer, self.apply_grid_settings, self)
+        dialog = SettingsDialog(self.viewer, self.apply_grid_settings, self, settings=self._settings)
         dialog.exec()
 
-    def apply_grid_settings(self, settings: Dict[str, Dict[str, Union[bool, float, QColor]]]) -> None:
+    def apply_grid_settings(
+        self,
+        settings: Dict[str, Dict[str, Union[bool, float, QColor]]],
+        application_settings: Optional[Dict[str, int]] = None,
+    ) -> None:
         self._apply_grid_settings_to_viewer(self.viewer, settings)
         self._save_grid_settings()
+        if application_settings is not None:
+            self._settings.setValue("application/initial_grid_depth", int(application_settings.get("initial_grid_depth", 6)))
+            self._settings.setValue("application/maximum_vertex_count", int(application_settings.get("maximum_vertex_count", 1_000_000)))
+            self._settings.sync()
+            self._initial_grid_depth = self._read_initial_grid_depth_setting()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if not self._confirm_discard_or_save_changes("closing the application"):
