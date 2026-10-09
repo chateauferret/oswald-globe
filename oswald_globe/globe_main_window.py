@@ -1460,6 +1460,8 @@ class GlobeMainWindow(QMainWindow):
             return
         for tool in self._tools.values():
             tool.dispose_options_dialog()
+        for filter_obj in self._filters.values():
+            filter_obj.dispose_options_dialog()
         if self._import_worker is not None:
             self._import_worker.cancel()
         if self._import_thread is not None:

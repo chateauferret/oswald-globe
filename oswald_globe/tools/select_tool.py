@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
 import numpy as np
-from PySide6.QtWidgets import QDialog, QWidget
+from PySide6.QtWidgets import QWidget
 
 from oswald_globe.brush_paint_command import BrushCommand
 from oswald_globe.icosphere_grid import IcosphereGrid
@@ -129,7 +129,7 @@ class SelectionLayerCommand:
 class SelectTool(BrushTool):
     _menu_label = "Select"
 
-    def create_options_dialog(self) -> Optional[QDialog]:
+    def create_options_dialog(self) -> SelectToolOptionsDialog:
         dialog = SelectToolOptionsDialog(
             self._parent,
             radius_km=self._radius_km,

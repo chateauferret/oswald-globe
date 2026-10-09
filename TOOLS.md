@@ -20,7 +20,7 @@ The file may contain:
 
 - one `Tool` subclass
 - one or more helper classes
-- one optional Qt options dialog class
+- one optional Qt options panel class
 - one optional undoable command or brush command class
 
 The file name can be anything you like, as long as it does not start with `_`.
@@ -53,9 +53,9 @@ Required methods:
 
 Optional methods:
 
-- `create_options_dialog(self) -> Optional[QDialog]`
-  - Returns a Qt dialog for tool settings.
-  - Called when the tool is activated and the dialog is needed.
+- `create_options_dialog(self) -> Optional[ToolOptionsDialog]`
+  - Returns a dockable panel for tool settings (the API retains its legacy name).
+  - Called when the tool is activated and the panel is needed.
 
 - `show_options_dialog(self)`
   - Built into the base class; normally you do not override it.
@@ -124,16 +124,15 @@ This is the pattern used by the built-in `PaintTool` and `SelectTool`.
 ```python
 from typing import Any, Dict, Optional
 
-from PySide6.QtWidgets import QDialog, QWidget
+from PySide6.QtWidgets import QWidget
 
 from oswald_globe.tools.tool import BrushTool
+from oswald_globe.tools.tool_options_dialog import ToolOptionsDialog
 
 
-class MyBrushToolOptionsDialog(QDialog):
+class MyBrushToolOptionsDialog(ToolOptionsDialog):
     def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self.setWindowTitle("My Tool Options")
-        self.resize(300, 120)
+        super().__init__(parent, title="My Tool Options", include_value=False, include_mode=False)
 
 
 class MyBrushTool(BrushTool):
@@ -144,7 +143,7 @@ class MyBrushTool(BrushTool):
         self._radius_km = 200
         self._falloff_percent = 35
 
-    def create_options_dialog(self) -> Optional[QDialog]:
+    def create_options_dialog(self) -> Optional[ToolOptionsDialog]:
         dialog = MyBrushToolOptionsDialog(self._parent)
         return dialog
 
@@ -161,19 +160,21 @@ class MyBrushTool(BrushTool):
         )
 ```
 
-## Creating a custom options dialog
+## Creating a custom options panel
 
 Tool settings should usually live in the same file as the tool class. This mirrors how the built-in paint and select tools are organized.
 
-A dialog can subclass `QDialog` directly, or subclass the shared `ToolOptionsDialog` in `oswald_globe/tools/tool_options_dialog.py` if you want to reuse the slider/spinbox pattern.
+Subclass the shared `ToolOptionsDialog` from `oswald_globe.tools.tool_options_dialog`. Despite its legacy name, it is a `QDockWidget`, not a dialog. It initially docks on the right and can be dragged to any edge or floated. Controls stack vertically on the left/right and run horizontally on the top/bottom. Floating preserves the last docked arrangement.
 
-Typical dialog responsibilities:
+Controls keep their compact size rather than stretching with the main window. Floating panels fit their contents without unused space.
+
+Typical panel responsibilities:
 
 - expose tool parameters
 - update the tool state when the user changes values
 - call the callback passed in as `on_brush_changed` when brush radius/falloff changes
 
-For example, the built-in tool dialogs set a radius slider, falloff slider, and optional mode/value controls.
+For example, the built-in tool panels set a radius slider, falloff slider, and optional mode/value controls.
 
 ## Brush commands and undo/redo
 

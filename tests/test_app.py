@@ -589,6 +589,21 @@ def test_close_event_discard_then_accepts_without_saving(qapp, monkeypatch: pyte
         window.close()
 
 
+def test_main_window_closes_floating_filter_panel(qapp):
+    window = create_window()
+    try:
+        window._filters_menu.actions()[0].trigger()
+        filter_obj = window._filters["fill"]
+        panel = filter_obj.options_dialog
+        panel.setFloating(True)
+        assert panel.isFloating()
+        window.close()
+        assert filter_obj.options_dialog is None
+        assert panel.isHidden()
+    finally:
+        window.close()
+
+
 def test_paint_tool_selection_shows_options_and_navigate_disposes(qapp):
     window = create_window()
     try:
@@ -609,8 +624,8 @@ def test_paint_tool_selection_shows_options_and_navigate_disposes(qapp):
         assert navigate_action.isChecked() is False
         assert paint_tool.options_dialog is not None
         assert paint_tool.options_dialog.windowTitle() == "Paint Tool Options"
-        assert bool(paint_tool.options_dialog.windowFlags() & Qt.WindowType.Tool) is True
-        assert bool(paint_tool.options_dialog.windowFlags() & Qt.WindowType.WindowStaysOnTopHint) is True
+        assert window.dockWidgetArea(paint_tool.options_dialog) == Qt.DockWidgetArea.RightDockWidgetArea
+        assert paint_tool.options_dialog.isFloating() is False
 
         sliders = paint_tool.options_dialog.findChildren(QSlider)
         ranges = sorted((slider.minimum(), slider.maximum()) for slider in sliders)
@@ -690,10 +705,18 @@ def test_paint_tool_selection_shows_options_and_navigate_disposes(qapp):
         assert select_tool.options_dialog.windowTitle() == "Select Tool Options"
 
         sliders = select_tool.options_dialog.findChildren(QSlider)
-        ranges = sorted((slider.minimum(), slider.maximum()) for slider in sliders if slider.isVisible())
+        ranges = sorted(
+            (slider.minimum(), slider.maximum())
+            for slider in sliders
+            if slider.isVisibleTo(select_tool.options_dialog)
+        )
         assert ranges == [(0, 100), (0, 1000)]
         spin_boxes = select_tool.options_dialog.findChildren(QSpinBox)
-        spin_ranges = sorted((spin.minimum(), spin.maximum()) for spin in spin_boxes if spin.isVisible())
+        spin_ranges = sorted(
+            (spin.minimum(), spin.maximum())
+            for spin in spin_boxes
+            if spin.isVisibleTo(select_tool.options_dialog)
+        )
         assert spin_ranges == [(0, 100), (0, 1000)]
         mode_combo = select_tool.options_dialog.findChild(QComboBox)
         assert mode_combo is not None

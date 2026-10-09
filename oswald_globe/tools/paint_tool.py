@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
 import numpy as np
-from PySide6.QtWidgets import QDialog, QWidget
+from PySide6.QtWidgets import QWidget
 
 from oswald_globe.brush_paint_command import BrushCommand
 from oswald_globe.icosphere_grid import IcosphereGrid
@@ -121,7 +121,7 @@ class PaintTool(BrushTool):
         self._value = 0
         self._mode = "Replace"
 
-    def create_options_dialog(self) -> Optional[QDialog]:
+    def create_options_dialog(self) -> PaintToolOptionsDialog:
         dialog = PaintToolOptionsDialog(
             self._parent,
             value=self._value,

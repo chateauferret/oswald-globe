@@ -20,7 +20,7 @@ The file may contain:
 
 - one `Filter` subclass
 - one or more helper classes
-- one optional Qt options dialog class
+- one optional Qt options panel class
 - one optional undoable command class
 
 The file name can be anything you like, as long as it does not start with `_`.
@@ -57,9 +57,9 @@ Required methods:
 
 Optional methods:
 
-- `create_options_dialog(self) -> Optional[QDialog]`
-  - Returns a Qt dialog for filter settings.
-  - Called when the filter is selected from the menu and the app wants to show its parameter dialog.
+- `create_options_dialog(self) -> Optional[ToolOptionsDialog]`
+  - Returns a dockable panel for filter settings (the API retains its legacy name).
+  - Called when the filter is selected from the menu and the app wants to show its parameter panel.
 
 - `show_options_dialog(self)`
   - Built into the base class; normally you do not override it.
@@ -116,16 +116,15 @@ This is the pattern used by the built-in `FillFilter`.
 ```python
 from typing import Any, Optional
 
-from PySide6.QtWidgets import QDialog, QWidget
+from PySide6.QtWidgets import QWidget
 
 from oswald_globe.filters.filter import Filter
+from oswald_globe.tools.tool_options_dialog import ToolOptionsDialog
 
 
-class MyFilterOptionsDialog(QDialog):
+class MyFilterOptionsDialog(ToolOptionsDialog):
     def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self.setWindowTitle("My Filter Options")
-        self.resize(360, 180)
+        super().__init__(parent, title="My Filter Options", include_radius=False, include_falloff=False)
 
 
 class MyFilter(Filter):
@@ -136,7 +135,7 @@ class MyFilter(Filter):
         self._value = 0
         self._mode = "Replace"
 
-    def create_options_dialog(self) -> Optional[QDialog]:
+    def create_options_dialog(self) -> Optional[ToolOptionsDialog]:
         dialog = MyFilterOptionsDialog(self._parent)
         return dialog
 
@@ -153,19 +152,21 @@ class MyFilter(Filter):
         pass
 ```
 
-## Creating a custom options dialog
+## Creating a custom options panel
 
 Filter settings should usually live in the same file as the filter class. This keeps the plugin self-contained and mirrors the built-in pattern used by the Fill filter.
 
-A dialog can subclass `QDialog` directly, or subclass the shared `ToolOptionsDialog` from `oswald_globe/tools/tool_options_dialog.py` if you want to reuse the standard slider/spinbox pattern.
+Subclass the shared `ToolOptionsDialog` from `oswald_globe.tools.tool_options_dialog`. Despite its legacy name, it is a `QDockWidget`, not a dialog. It initially docks on the right and can be dragged to any edge or floated. Controls stack vertically on the left/right and run horizontally on the top/bottom. Floating preserves the last docked arrangement. Use `set_action_widget()` to include action buttons in both layouts.
 
-Typical dialog responsibilities:
+Controls keep their compact size rather than stretching with the main window. Floating panels fit their contents without unused space.
+
+Typical panel responsibilities:
 
 - expose filter parameters
 - store the current values on the filter instance
 - apply the operation immediately when the user chooses Apply
 - commit the edit when the user clicks OK
-- close or keep the dialog open depending on the user action
+- close or keep the panel open depending on the user action
 
 The built-in Fill filter exposes a value slider and mode selector, and it provides the expected `Apply` / `OK` / `Cancel` behavior.
 
@@ -204,7 +205,7 @@ oswald_globe/
 The `my_custom_filter.py` file can define:
 
 - a `Filter` subclass
-- a Qt parameter dialog class
+- a Qt parameter panel class
 - an undoable command class for redo/undo
 - optional helper utilities
 
@@ -214,7 +215,7 @@ The built-in `FillFilter` demonstrates the intended architecture:
 
 - it is discovered by scanning `oswald_globe/filters`
 - it adds a menu action under `Filters`
-- it shows a parameter dialog with `Apply`, `OK`, and `Cancel`
+- it shows a dockable parameter panel with `Apply`, `OK`, and `Cancel`
 - it applies the selected operation over the whole selection or the whole globe
 - it stores its work as an undoable command so it can be undone/redone
 
@@ -227,7 +228,7 @@ Filter plugins in Oswald Globe are intentionally simple:
 - discover automatically from `oswald_globe/filters`
 - subclass `Filter`
 - add a menu action with `create_menu_action()`
-- optionally show a parameter dialog
+- optionally show a parameter panel
 - apply the selected operation in `apply()`
 - push undoable commands when the edit should be reversible
 

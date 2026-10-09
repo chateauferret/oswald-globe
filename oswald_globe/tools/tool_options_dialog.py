@@ -1,4 +1,4 @@
-"""Paint tool options dialog."""
+"""Compact, dockable tool and filter options."""
 
 from __future__ import annotations
 
@@ -8,9 +8,10 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QComboBox,
-    QDialog,
+    QDockWidget,
     QGridLayout,
     QLabel,
+    QMainWindow,
     QSlider,
     QSizePolicy,
     QSpinBox,
@@ -18,7 +19,9 @@ from PySide6.QtWidgets import (
 )
 
 
-class ToolOptionsDialog(QDialog):
+class ToolOptionsDialog(QDockWidget):
+    """Options panel; the legacy class name is retained for plugins."""
+
     _PAINT_MODES = ("Replace", "Add", "Subtract", "Minimum", "Maximum", "Multiply", "Average")
 
     class _SliderBoundSpinBox(QSpinBox):
@@ -79,14 +82,17 @@ class ToolOptionsDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.setWindowFlag(Qt.WindowType.Tool, True)
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        self.setModal(False)
-        self.resize(360, 220)
-
-        layout = QGridLayout(self)
-        layout.setHorizontalSpacing(12)
-        layout.setVerticalSpacing(8)
+        self.setObjectName(title.replace(" ", ""))
+        self.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        self._horizontal = False
+        self._content = QWidget(self)
+        self._controls_layout = QGridLayout(self._content)
+        self._controls_layout.setContentsMargins(6, 6, 6, 6)
+        self._controls_layout.setSpacing(4)
+        self._controls_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.setWidget(self._content)
+        self._rows: list[tuple[QLabel, QWidget, Optional[QWidget]]] = []
+        self._action_widget: Optional[QWidget] = None
 
         self.value_slider = QSlider(Qt.Orientation.Horizontal, self)
         self.value_slider.setRange(-32767, 32767)
@@ -107,41 +113,84 @@ class ToolOptionsDialog(QDialog):
         self.falloff_slider.setValue(int(falloff_percent))
         self.falloff_spin = self._SliderBoundSpinBox(self.falloff_slider, self)
 
-        row = 0
         if include_value:
-            layout.addWidget(QLabel("Value"), row, 0)
-            layout.addWidget(self.value_slider, row, 1)
-            layout.addWidget(self.value_spin, row, 2)
-            row += 1
+            self._rows.append((QLabel("Value"), self.value_slider, self.value_spin))
         else:
             self.value_slider.hide()
             self.value_spin.hide()
 
         if include_mode:
-            layout.addWidget(QLabel("Mode"), row, 0)
-            layout.addWidget(self.mode_combo, row, 1, 1, 2)
-            row += 1
+            self._rows.append((QLabel("Mode"), self.mode_combo, None))
         else:
             self.mode_combo.hide()
 
         if include_radius:
-            layout.addWidget(QLabel("Radius (km)"), row, 0)
-            layout.addWidget(self.radius_slider, row, 1)
-            layout.addWidget(self.radius_spin, row, 2)
-            row += 1
+            self._rows.append((QLabel("Radius (km)"), self.radius_slider, self.radius_spin))
         else:
             self.radius_slider.hide()
             self.radius_spin.hide()
 
         if include_falloff:
-            layout.addWidget(QLabel("Falloff (%)"), row, 0)
-            layout.addWidget(self.falloff_slider, row, 1)
-            layout.addWidget(self.falloff_spin, row, 2)
+            self._rows.append((QLabel("Falloff (%)"), self.falloff_slider, self.falloff_spin))
         else:
             self.falloff_slider.hide()
             self.falloff_spin.hide()
 
-        layout.setColumnStretch(1, 1)
-        layout.setColumnStretch(2, 0)
-        self.value_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.value_spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        for slider in (self.value_slider, self.radius_slider, self.falloff_slider):
+            slider.setFixedWidth(120)
+            slider.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        for control in (self.value_spin, self.radius_spin, self.falloff_spin, self.mode_combo):
+            control.setFixedSize(control.sizeHint())
+        self._relayout_controls()
+        self.dockLocationChanged.connect(self._dock_location_changed)
+        self.topLevelChanged.connect(self._sync_content_size)
+        if isinstance(parent, QMainWindow):
+            parent.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self)
+
+    def set_action_widget(self, widget: QWidget) -> None:
+        widget.setFixedSize(widget.sizeHint())
+        self._action_widget = widget
+        self._relayout_controls()
+
+    def _dock_location_changed(self, area: Qt.DockWidgetArea) -> None:
+        # Floating reports NoDockWidgetArea; retain the last docked arrangement.
+        if area == Qt.DockWidgetArea.NoDockWidgetArea:
+            return
+        self._horizontal = area in (
+            Qt.DockWidgetArea.TopDockWidgetArea,
+            Qt.DockWidgetArea.BottomDockWidgetArea,
+        )
+        self._relayout_controls()
+
+    def _relayout_controls(self) -> None:
+        layout = self._controls_layout
+        while layout.count():
+            layout.takeAt(0)
+        for column in range(layout.columnCount()):
+            layout.setColumnStretch(column, 0)
+        for index, (label, control, spin) in enumerate(self._rows):
+            if self._horizontal:
+                column = 2 * index
+                layout.addWidget(label, 0, column, 1, 2)
+                layout.addWidget(control, 1, column, 1, 1 if spin is not None else 2)
+                if spin is not None:
+                    layout.addWidget(spin, 1, column + 1)
+            else:
+                layout.addWidget(label, index, 0)
+                layout.addWidget(control, index, 1, 1, 1 if spin is not None else 2)
+                if spin is not None:
+                    layout.addWidget(spin, index, 2)
+        if self._action_widget is not None:
+            if self._horizontal:
+                layout.addWidget(self._action_widget, 0, 2 * len(self._rows), 2, 1)
+            else:
+                layout.addWidget(self._action_widget, len(self._rows), 0, 1, 3)
+        self._sync_content_size()
+
+    def _sync_content_size(self) -> None:
+        if self.isFloating():
+            self._content.setFixedSize(self._controls_layout.sizeHint())
+            self.adjustSize()
+        else:
+            self._content.setMinimumSize(0, 0)
+            self._content.setMaximumSize(16777215, 16777215)

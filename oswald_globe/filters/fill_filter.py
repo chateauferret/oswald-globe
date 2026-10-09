@@ -8,7 +8,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 from PySide6.QtCore import Signal, Slot
 from PySide6.QtGui import QAction, QActionGroup
-from PySide6.QtWidgets import QDialog, QDialogButtonBox, QWidget
+from PySide6.QtWidgets import QDialogButtonBox, QWidget
 
 from oswald_globe.icosphere_grid import IcosphereGrid
 from oswald_globe.tools.paint_tool import PaintToolOptionsDialog
@@ -45,9 +45,13 @@ class FillFilterOptionsDialog(PaintToolOptionsDialog):
         buttons.addButton(QDialogButtonBox.StandardButton.Ok)
         buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
+        buttons.rejected.connect(self.close)
         self._apply_button.clicked.connect(self._apply_requested)
-        self.layout().addWidget(buttons, self.layout().rowCount(), 0, 1, 3)
+        self.set_action_widget(buttons)
+
+    def accept(self) -> None:
+        self.applyRequested.emit()
+        self.close()
 
     def _apply_requested(self) -> None:
         self.applyRequested.emit()
@@ -122,7 +126,7 @@ class FillFilter(Filter):
         self._menu_action = action
         return action
 
-    def create_options_dialog(self) -> Optional[QDialog]:
+    def create_options_dialog(self) -> FillFilterOptionsDialog:
         dialog = FillFilterOptionsDialog(
             self._parent,
             value=self._value,
@@ -131,7 +135,6 @@ class FillFilter(Filter):
         dialog.radius_slider.valueChanged.connect(self._notify_brush_changed)
         dialog.falloff_slider.valueChanged.connect(self._notify_brush_changed)
         dialog.applyRequested.connect(self._apply_from_dialog)
-        dialog.accepted.connect(self._apply_from_dialog)
         return dialog
 
     @Slot()
