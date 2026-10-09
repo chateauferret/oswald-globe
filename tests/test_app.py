@@ -1631,6 +1631,139 @@ def test_grid_menu_requires_selection_and_tracks_undo_redo(qapp, tmp_path: Path)
         window.close()
 
 
+def test_optimise_grid_cancel_is_noop(qapp, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("application/initial_grid_depth", 4)
+    window = create_window(settings=settings)
+    try:
+        called = {"value": False}
+
+        def fake_from_equirectangular(*args, **kwargs):
+            called["value"] = True
+            raise AssertionError("from_equirectangular should not be called when optimisation is cancelled.")
+
+        monkeypatch.setattr(
+            globe_main_window.IcosphereGrid,
+            "from_equirectangular",
+            fake_from_equirectangular,
+        )
+        monkeypatch.setattr(
+            globe_main_window.QMessageBox,
+            "warning",
+            lambda *args, **kwargs: QMessageBox.StandardButton.Cancel,
+        )
+
+        before_grid = window.viewer.gl_widget.mesh_grid
+        window.optimise_grid()
+
+        assert window.viewer.gl_widget.mesh_grid is before_grid
+        assert called["value"] is False
+        assert not window._undo_stack.can_undo()
+    finally:
+        window.close()
+
+
+def test_optimise_grid_rebuilds_mesh_and_clears_undo_history(qapp, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("application/initial_grid_depth", 4)
+    window = create_window(settings=settings)
+    try:
+        current_grid = window.viewer.gl_widget.mesh_grid
+        assert current_grid is not None
+        original_vertex_count = current_grid.vertex_count()
+
+        window.select_all_vertices()
+        assert window._undo_stack.can_undo()
+
+        replacement_grid = IcosphereGrid()
+        replacement_grid.subdivide_uniform(2)
+        captured = {}
+
+        def fake_build(source_grid):
+            captured["source_grid"] = source_grid
+            return replacement_grid
+
+        monkeypatch.setattr(
+            window,
+            "_build_optimised_grid_from_existing_data",
+            fake_build,
+        )
+        monkeypatch.setattr(
+            globe_main_window.QMessageBox,
+            "warning",
+            lambda *args, **kwargs: QMessageBox.StandardButton.Ok,
+        )
+
+        window.optimise_grid()
+
+        assert captured["source_grid"] is current_grid
+        assert window.viewer.gl_widget.mesh_grid is replacement_grid
+        assert window.viewer.mesh_grid is replacement_grid
+        assert window.viewer.gl_widget.mesh_grid.vertex_count() != original_vertex_count
+        assert window.viewer.footer_left_label.text() == f"{replacement_grid.vertex_count():,} vertices"
+        assert not window._undo_stack.can_undo()
+        assert window._project_metadata_dirty is True
+    finally:
+        window._project_metadata_dirty = False
+        window._undo_stack.set_clean()
+        window.close()
+
+
+def test_optimise_grid_builds_from_existing_mesh_data_without_raster_cache(
+    qapp, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("application/initial_grid_depth", 4)
+    window = create_window(settings=settings)
+    try:
+        current_grid = window.viewer.gl_widget.mesh_grid
+        assert current_grid is not None
+
+        monkeypatch.setattr(
+            window.viewer.gl_widget,
+            "current_raster_data",
+            lambda: (_ for _ in ()).throw(AssertionError("optimise_grid should not use cached raster data.")),
+        )
+        replacement_grid = IcosphereGrid()
+        replacement_grid.subdivide_uniform(1)
+        captured = {}
+
+        def fake_from_sampler(value_fn, min_level, max_level, threshold, progress_callback=None, is_cancelled=None):
+            probe = np.asarray(value_fn(np.array([0.0]), np.array([0.0])), dtype=np.float64)
+            captured["probe"] = probe
+            captured["min_level"] = min_level
+            captured["max_level"] = max_level
+            captured["threshold"] = threshold
+            return replacement_grid
+
+        monkeypatch.setattr(
+            globe_main_window.IcosphereGrid,
+            "from_sampler",
+            fake_from_sampler,
+        )
+        monkeypatch.setattr(
+            current_grid,
+            "sample",
+            lambda lat_deg, lon_deg: np.full(np.asarray(lat_deg).shape, 123.0, dtype=np.float64),
+        )
+        monkeypatch.setattr(
+            globe_main_window.QMessageBox,
+            "warning",
+            lambda *args, **kwargs: QMessageBox.StandardButton.Ok,
+        )
+
+        window.optimise_grid()
+
+        np.testing.assert_allclose(captured["probe"], np.array([123.0], dtype=np.float64))
+        assert captured["min_level"] == window._mesh_min_level
+        assert captured["max_level"] == window._mesh_max_level
+        assert captured["threshold"] == window._mesh_threshold
+    finally:
+        window._project_metadata_dirty = False
+        window._undo_stack.set_clean()
+        window.close()
+
+
 @pytest.mark.parametrize(
     ("action_name", "mesh_method"),
     [

@@ -811,6 +811,28 @@ class IcosphereGrid:
         return 1 + max(self._far_side_depth(a, m), self._far_side_depth(m, b))
 
     @classmethod
+    def from_sampler(
+        cls,
+        value_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
+        min_level: int = 2,
+        max_level: int = 8,
+        threshold: float = 50.0,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> "IcosphereGrid":
+        """Build an adaptive icosphere from a callable value sampler."""
+        grid = cls()
+        grid.refine_adaptive(
+            value_fn,
+            min_level=min_level,
+            max_level=max_level,
+            threshold=threshold,
+            progress_callback=progress_callback,
+            is_cancelled=is_cancelled,
+        )
+        return grid
+
+    @classmethod
     def from_equirectangular(
         cls,
         arr: np.ndarray,
@@ -821,8 +843,7 @@ class IcosphereGrid:
         is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> "IcosphereGrid":
         """Build an adaptive icosphere from a 2D equirectangular raster."""
-        grid = cls()
-        grid.refine_adaptive(
+        return cls.from_sampler(
             lambda lat, lon: sample_equirectangular(arr, lat, lon),
             min_level=min_level,
             max_level=max_level,
@@ -830,7 +851,6 @@ class IcosphereGrid:
             progress_callback=progress_callback,
             is_cancelled=is_cancelled,
         )
-        return grid
 
     def _build_kdtree(self):
         if self._kdtree is not None:

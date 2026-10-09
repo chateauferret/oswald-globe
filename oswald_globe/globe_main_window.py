@@ -525,6 +525,7 @@ class GlobeMainWindow(QMainWindow):
         self._grid_menu: Optional[QMenu] = None
         self._select_menu: Optional[QMenu] = None
         self._select_by_value_menu: Optional[QMenu] = None
+        self._optimise_grid_action: Optional[QAction] = None
         self._undo_action: Optional[QAction] = None
         self._redo_action: Optional[QAction] = None
         self._tools_menu: Optional[QMenu] = None
@@ -628,6 +629,10 @@ class GlobeMainWindow(QMainWindow):
         remove_detail_action = QAction("Remove detail", self)
         remove_detail_action.triggered.connect(self.remove_grid_detail)
         self._grid_menu.addAction(remove_detail_action)
+
+        self._optimise_grid_action = QAction("Optimise grid", self)
+        self._optimise_grid_action.triggered.connect(self.optimise_grid)
+        self._edit_menu.addAction(self._optimise_grid_action)
 
         self._select_menu = self.menuBar().addMenu("Select")
 
@@ -869,6 +874,45 @@ class GlobeMainWindow(QMainWindow):
         finally:
             self._refresh_memory_status()
 
+    @Slot()
+    def optimise_grid(self) -> None:
+        mesh_grid = self.viewer.gl_widget.mesh_grid
+        if mesh_grid is None:
+            raise RuntimeError("Optimise grid requires a mesh-backed globe.")
+
+        choice = QMessageBox.warning(
+            self,
+            "Optimise grid",
+            "This will regenerate the grid and cannot be undone. Do you want to proceed?",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if choice != QMessageBox.StandardButton.Ok:
+            return
+
+        try:
+            with self._grid_detail_busy():
+                optimised_grid = self._build_optimised_grid_from_existing_data(mesh_grid)
+                self.viewer.mesh_grid = optimised_grid
+                self.viewer.gl_widget.mesh_grid = optimised_grid
+                self.viewer.gl_widget.rebuild_mesh_geometry()
+                self.viewer.refresh_vertex_count()
+                self._undo_stack.clear()
+                self._mark_project_metadata_dirty()
+        except Exception as exc:
+            QMessageBox.critical(self, "Failed to optimise grid", str(exc))
+        finally:
+            self._refresh_memory_status()
+
+    def _build_optimised_grid_from_existing_data(self, source_grid: IcosphereGrid) -> IcosphereGrid:
+        optimised_grid = IcosphereGrid.from_sampler(
+            lambda lat_deg, lon_deg: source_grid.sample(lat_deg, lon_deg),
+            min_level=self._mesh_min_level,
+            max_level=self._mesh_max_level,
+            threshold=self._mesh_threshold,
+        )
+        return optimised_grid
+
     def _refresh_memory_status(self) -> None:
         process_memory, total_memory = _get_memory_usage_bytes()
         safe_maximum = total_memory * 3 // 4
@@ -882,6 +926,8 @@ class GlobeMainWindow(QMainWindow):
             self._undo_action.setEnabled(self._undo_stack.can_undo())
         if self._redo_action is not None:
             self._redo_action.setEnabled(self._undo_stack.can_redo())
+        if self._optimise_grid_action is not None:
+            self._optimise_grid_action.setEnabled(self.viewer.gl_widget.mesh_grid is not None)
         if self._grid_menu is not None:
             mesh_grid = self.viewer.gl_widget.mesh_grid
             self._grid_menu.setEnabled(mesh_grid is not None and mesh_grid.has_selection)
