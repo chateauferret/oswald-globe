@@ -16,9 +16,8 @@ from __future__ import annotations
 
 import gc
 import sys
-from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Type
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -27,11 +26,11 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 try:
-    from .layer import Layer, LayerLegend
+    from .layer import DataLayer, ElevationLayer, LayerLegend
     from .progress_tracker import ProgressTracker, emit_progress
     from .utils import sample_equirectangular
 except ImportError:  # pragma: no cover - supports running as a script
-    from oswald_globe.layer import Layer, LayerLegend
+    from oswald_globe.layer import DataLayer, ElevationLayer, LayerLegend
     from oswald_globe.progress_tracker import ProgressTracker, emit_progress
     from oswald_globe.utils import sample_equirectangular
 
@@ -94,14 +93,10 @@ class IcosphereGrid:
 
     def __init__(self):
         self._vertices: List[np.ndarray] = [v.copy() for v in _BASE_VERTICES]
-        self._layers: "OrderedDict[str, Layer]" = OrderedDict()
+        self._layers: List[DataLayer] = []
+        self._layers_by_name: Dict[str, DataLayer] = {}
+        self._selection_values = np.zeros(len(self._vertices), dtype=np.float64)
         self._ensure_layer("elevation", values=np.full(len(self._vertices), np.nan, dtype=np.float64))
-        self._ensure_layer(
-            self.SELECTION_LAYER_NAME,
-            values=np.zeros(len(self._vertices), dtype=np.float64),
-            description="Soft vertex selection mask",
-            visible=False,
-        )
         self._edge_midpoints: Dict[Tuple[int, int], int] = {}
         self.roots: List[_Face] = [_Face(f, 0) for f in _BASE_FACES]
 
@@ -115,7 +110,12 @@ class IcosphereGrid:
 
     def layer_names(self) -> List[str]:
         """Return the names of the stored data layers in insertion order."""
-        return list(self._layers.keys())
+        return [layer.name for layer in self._layers]
+
+    @property
+    def layers(self) -> List[DataLayer]:
+        """Return the stored data layers in insertion order."""
+        return list(self._layers)
 
     @staticmethod
     def _coerce_legend_reference(legend: Any) -> Optional[LayerLegend]:
@@ -138,17 +138,20 @@ class IcosphereGrid:
     def add_layer(
         self,
         name: str,
-        values: Optional[np.ndarray] = None,
+        values: Optional[np.ndarray | DataLayer] = None,
         *,
+        layer_class: Optional[Type[DataLayer]] = None,
         description: str = "",
         visible: bool = True,
         opacity: float = 100.0,
         legend: Any = None,
         z_index: Optional[int] = None,
-    ) -> Layer:
+    ) -> DataLayer:
         """Create or replace a layer keyed by name, with one value per vertex."""
         name = str(name)
-        if isinstance(values, Layer):
+        if name == self.SELECTION_LAYER_NAME:
+            raise ValueError("Selection status values are stored separately from data layers.")
+        if isinstance(values, DataLayer):
             layer = values
             layer.name = name
             if description:
@@ -161,11 +164,11 @@ class IcosphereGrid:
                 layer.legend = self._coerce_legend_reference(legend)
             if z_index is not None:
                 layer.z_index = int(z_index)
-            self._layers[name] = layer
+            self._store_layer(layer)
             return layer
 
-        if name in self._layers:
-            layer = self._layers[name]
+        if name in self._layers_by_name:
+            layer = self._layers_by_name[name]
             if values is not None:
                 arr = np.asarray(values, dtype=np.float64)
                 if arr.shape[0] != len(self._vertices):
@@ -184,34 +187,48 @@ class IcosphereGrid:
         if values is None:
             values = np.full(
                 len(self._vertices),
-                self._default_layer_fill_value(name),
+                self._default_layer_fill_value(),
                 dtype=np.float64,
             )
         arr = np.asarray(values, dtype=np.float64)
         if arr.shape[0] != len(self._vertices):
             raise ValueError(f"Layer {name!r} must contain one value per vertex ({len(self._vertices)}), got shape {arr.shape}.")
-        layer = Layer(
+        concrete_layer_class = ElevationLayer if layer_class is None else layer_class
+        layer = concrete_layer_class(
             name=name,
-            values=arr,
+            _values=arr,
             description=description,
             visible=visible,
             opacity=opacity,
             legend=self._coerce_legend_reference(legend),
             z_index=len(self._layers) if z_index is None else int(z_index),
         )
-        self._layers[name] = layer
+        self._store_layer(layer)
         return layer
 
-    def _ensure_layer(self, name: str, *, values: Optional[np.ndarray] = None, **kwargs: Any) -> Layer:
+    def _store_layer(self, layer: DataLayer) -> None:
+        existing = self._layers_by_name.get(layer.name)
+        if existing is None:
+            self._layers.append(layer)
+        else:
+            for index, current in enumerate(self._layers):
+                if current.name == layer.name:
+                    self._layers[index] = layer
+                    break
+        self._layers_by_name[layer.name] = layer
+
+    def _ensure_layer(self, name: str, *, values: Optional[np.ndarray] = None, **kwargs: Any) -> DataLayer:
         """Ensure a layer exists and matches the current vertex count."""
-        if name not in self._layers:
+        if name == self.SELECTION_LAYER_NAME:
+            raise ValueError("Selection status values are stored separately from data layers.")
+        if name not in self._layers_by_name:
             return self.add_layer(name, values, **kwargs)
 
-        layer = self._layers[name]
+        layer = self._layers_by_name[name]
         if layer.values.shape[0] != len(self._vertices):
             padded = np.full(
                 len(self._vertices),
-                self._default_layer_fill_value(name),
+                self._default_layer_fill_value(),
                 dtype=np.float64,
             )
             copy_count = min(layer.values.shape[0], len(self._vertices))
@@ -221,21 +238,46 @@ class IcosphereGrid:
         return layer
 
     @classmethod
-    def _default_layer_fill_value(cls, name: str) -> float:
-        return 0.0 if str(name) == cls.SELECTION_LAYER_NAME else np.nan
+    def _default_layer_fill_value(cls) -> float:
+        return np.nan
 
-    def get_layer(self, name: str) -> Layer:
+    @staticmethod
+    def _layer_class_for_kind(kind: str) -> Type[DataLayer]:
+        normalized_kind = str(kind)
+        if normalized_kind == "elevation":
+            return ElevationLayer
+        raise ValueError(f"Unsupported serialized layer kind {normalized_kind!r}.")
+
+    def get_layer(self, name: str) -> DataLayer:
         """Return the named layer object."""
         return self._ensure_layer(name)
 
-    def set_layer(self, name: str, values: np.ndarray, **kwargs: Any) -> Layer:
+    def set_layer(self, name: str, values: np.ndarray, **kwargs: Any) -> DataLayer:
         """Set a named data layer for all vertices."""
         return self.add_layer(name, values, **kwargs)
 
     @property
+    def selection_values(self) -> np.ndarray:
+        """Soft vertex selection mask shared by all data layers."""
+        return self._selection_values
+
+    @selection_values.setter
+    def selection_values(self, values: np.ndarray) -> None:
+        selection_values = np.asarray(values, dtype=np.float64)
+        if selection_values.ndim != 1:
+            raise ValueError(
+                f"Selection status values must be 1D, got shape {selection_values.shape}."
+            )
+        if selection_values.shape[0] != len(self._vertices):
+            raise ValueError(
+                "Selection status values must contain one value per vertex "
+                f"({len(self._vertices)}), got shape {selection_values.shape}."
+            )
+        self._selection_values = selection_values
+
+    @property
     def has_selection(self) -> bool:
-        selection = self.get_layer(self.SELECTION_LAYER_NAME).values
-        return bool(np.any(selection > 0.0))
+        return bool(np.any(self.selection_values > 0.0))
 
     @property
     def _values(self) -> np.ndarray:
@@ -257,9 +299,9 @@ class IcosphereGrid:
     def _add_vertex(self, xyz: np.ndarray) -> int:
         idx = len(self._vertices)
         self._vertices.append(xyz)
-        for layer_name in self.layer_names():
-            layer = self._layers[layer_name]
-            layer.values = np.append(layer.values, self._default_layer_fill_value(layer_name))
+        for layer in self._layers:
+            layer.values = np.append(layer.values, self._default_layer_fill_value())
+        self._selection_values = np.append(self._selection_values, 0.0)
         return idx
 
     @staticmethod
@@ -328,7 +370,7 @@ class IcosphereGrid:
 
     def subdivide_selected_faces_once(self) -> int:
         """Refine selected red leaves once, then balance local transitions."""
-        selection_values = self.get_layer(self.SELECTION_LAYER_NAME).values
+        selection_values = self.selection_values
         selected_faces = [
             face
             for face in self._red_leaves()
@@ -355,10 +397,15 @@ class IcosphereGrid:
             # Shared midpoints may already hold edited or sampled layer data.
             if midpoint < old_vertex_count:
                 continue
-            for layer_name, layer in self._layers.items():
+            for layer in self._layers:
                 layer.values[midpoint] = self._interpolate_edge_value(
-                    layer.values[a], layer.values[b], self._default_layer_fill_value(layer_name)
+                    layer.values[a], layer.values[b], self._default_layer_fill_value()
                 )
+            self._selection_values[midpoint] = self._interpolate_edge_value(
+                self._selection_values[a],
+                self._selection_values[b],
+                0.0,
+            )
 
     def _faces_needing_balance(self, max_neighbors: Optional[int] = None) -> List[_Face]:
         leaves = self._red_leaves()
@@ -418,9 +465,9 @@ class IcosphereGrid:
         self._vertices = [self._vertices[index] for index in kept_indices]
         gc.collect()
 
-        for layer_name in self.layer_names():
-            layer = self._layers[layer_name]
+        for layer in self._layers:
             layer.values = np.asarray(layer.values[kept_indices], dtype=np.float64)
+        self._selection_values = np.asarray(self._selection_values[kept_indices], dtype=np.float64)
 
         stack = list(self.roots)
         while stack:
@@ -433,7 +480,7 @@ class IcosphereGrid:
 
     def remove_selected_lowest_level_vertices(self) -> int:
         """Coarsen one level by collapsing selected deepest red faces and pruning orphaned vertices."""
-        selection_values = self.get_layer(self.SELECTION_LAYER_NAME).values
+        selection_values = self.selection_values
         candidates: List[Tuple[_Face, int, int, int, int]] = []
         stack = list(self.roots)
         while stack:
@@ -968,11 +1015,11 @@ class IcosphereGrid:
 
         layer_metadata = []
         layer_values: Dict[str, np.ndarray] = {}
-        for layer_index, layer_name in enumerate(self.layer_names()):
-            layer = self._layers[layer_name]
+        for layer_index, layer in enumerate(self._layers):
             layer_key = f"layer_values_{layer_index}"
             layer_metadata.append(
                 {
+                    "kind": layer.kind,
                     "name": layer.name,
                     "description": layer.description,
                     "visible": layer.visible,
@@ -993,6 +1040,7 @@ class IcosphereGrid:
             "edge_midpoint_keys": edge_midpoint_keys,
             "edge_midpoint_values": edge_midpoint_values,
             "layer_metadata": layer_metadata,
+            "selection_values": np.asarray(self.selection_values, dtype=np.float64),
             **layer_values,
         }
 
@@ -1029,7 +1077,10 @@ class IcosphereGrid:
 
         grid = cls()
         grid._vertices = [np.asarray(vertex, dtype=np.float64) for vertex in vertices]
-        grid._layers = OrderedDict()
+        grid._layers = []
+        grid._layers_by_name = {}
+        grid._selection_values = np.zeros(len(grid._vertices), dtype=np.float64)
+        legacy_selection_values: Optional[np.ndarray] = None
 
         for descriptor in layer_metadata:
             if not isinstance(descriptor, Mapping):
@@ -1041,9 +1092,15 @@ class IcosphereGrid:
                     f"Serialized layer {layer_name!r} is missing its value array {values_key!r}."
                 )
             legend_name = descriptor.get("legend_name")
+            layer_values = np.asarray(state[values_key], dtype=np.float64)
+            if layer_name == cls.SELECTION_LAYER_NAME:
+                legacy_selection_values = layer_values
+                continue
+            layer_kind = str(descriptor.get("kind", "elevation"))
             grid.add_layer(
                 layer_name,
-                np.asarray(state[values_key], dtype=np.float64),
+                layer_values,
+                layer_class=cls._layer_class_for_kind(layer_kind),
                 description=str(descriptor.get("description", "")),
                 visible=bool(descriptor.get("visible", True)),
                 opacity=float(descriptor.get("opacity", 100.0)),
@@ -1051,18 +1108,13 @@ class IcosphereGrid:
                 z_index=int(descriptor.get("z_index", len(grid._layers))),
             )
 
-        if "elevation" not in grid._layers:
+        if "elevation" not in grid._layers_by_name:
             raise ValueError("Serialized icosphere grid must include an 'elevation' layer.")
-        if cls.SELECTION_LAYER_NAME not in grid._layers:
-            grid.add_layer(
-                cls.SELECTION_LAYER_NAME,
-                np.zeros(len(grid._vertices), dtype=np.float64),
-                description="Soft vertex selection mask",
-                visible=False,
-            )
-        selection_layer = grid.get_layer(cls.SELECTION_LAYER_NAME)
-        selection_layer.values = np.clip(
-            np.nan_to_num(selection_layer.values, nan=0.0),
+        raw_selection_values = state.get("selection_values", legacy_selection_values)
+        if raw_selection_values is None:
+            raw_selection_values = np.zeros(len(grid._vertices), dtype=np.float64)
+        grid.selection_values = np.clip(
+            np.nan_to_num(np.asarray(raw_selection_values, dtype=np.float64), nan=0.0),
             0.0,
             1.0,
         )

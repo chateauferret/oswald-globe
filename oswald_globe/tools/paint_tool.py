@@ -8,7 +8,8 @@ from typing import Any, Callable, Dict, Optional
 import numpy as np
 from PySide6.QtWidgets import QWidget
 
-from oswald_globe.brush_paint_command import BrushCommand
+from oswald_globe.algorithms.apply_value import ApplyValue
+from oswald_globe.tools.brush_command import BrushCommand
 from oswald_globe.icosphere_grid import IcosphereGrid
 
 from .tool import BrushTool
@@ -54,25 +55,6 @@ class BrushPaintCommand(BrushCommand):
     def _apply(self, indices: np.ndarray, values: np.ndarray) -> None:
         self.apply_vertex_values(indices, values)
 
-    @staticmethod
-    def _apply_paint_mode(existing_values: np.ndarray, paint_value: float, paint_mode: str) -> np.ndarray:
-        mode = str(paint_mode)
-        if mode == "Replace":
-            return np.full(existing_values.shape, paint_value, dtype=np.float64)
-        if mode == "Add":
-            return existing_values + paint_value
-        if mode == "Subtract":
-            return existing_values - paint_value
-        if mode == "Minimum":
-            return np.minimum(existing_values, paint_value)
-        if mode == "Maximum":
-            return np.maximum(existing_values, paint_value)
-        if mode == "Multiply":
-            return existing_values * paint_value
-        if mode == "Average":
-            return (existing_values + paint_value) / 2.0
-        raise ValueError(f"Unsupported paint mode: {paint_mode!r}")
-
     def _capture_values(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         inner_radius, outer_radius, angular_distances, vertex_indices = self._capture_vertex_distances(
             self.mesh_grid,
@@ -88,28 +70,29 @@ class BrushPaintCommand(BrushCommand):
         if vertex_indices.size == 0:
             return vertex_indices, before_values, after_values
 
-        paint_value = float(self.paint_value)
-        operated_values = self._apply_paint_mode(before_values, paint_value, self.paint_mode)
-        brush_values = before_values.copy()
+        brush_weights = np.zeros(before_values.shape, dtype=np.float64)
         if inner_radius >= outer_radius - 1e-12:
-            brush_values = operated_values
+            brush_weights.fill(1.0)
         else:
             affected_distances = angular_distances[vertex_indices]
             inner_mask = affected_distances <= inner_radius + 1e-12
-            brush_values[inner_mask] = operated_values[inner_mask]
+            brush_weights[inner_mask] = 1.0
 
             transition_mask = ~inner_mask
             if np.any(transition_mask):
-                blend = (affected_distances[transition_mask] - inner_radius) / (outer_radius - inner_radius)
-                brush_values[transition_mask] = (
-                    (1.0 - blend) * operated_values[transition_mask] + blend * before_values[transition_mask]
+                brush_weights[transition_mask] = 1.0 - (
+                    (affected_distances[transition_mask] - inner_radius) / (outer_radius - inner_radius)
                 )
 
-        if not self.mesh_grid.has_selection:
-            return vertex_indices, before_values, brush_values
+        if self.mesh_grid.has_selection:
+            brush_weights *= self.mesh_grid.selection_values[vertex_indices]
 
-        selection_values = self.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values[vertex_indices]
-        after_values = before_values + selection_values * (brush_values - before_values)
+        after_values = ApplyValue.apply(
+            before_values,
+            float(self.paint_value),
+            self.paint_mode,
+            weights=brush_weights,
+        )
         return vertex_indices, before_values, after_values
 
 

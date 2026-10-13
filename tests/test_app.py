@@ -7,7 +7,7 @@ from PIL import Image
 import pytest
 from PySide6.QtCore import QDir, QEvent, QSettings, Qt, QPointF
 from PySide6.QtGui import QColor, QCloseEvent, QMouseEvent
-from PySide6.QtWidgets import QComboBox, QFileDialog, QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox, QToolTip
+from PySide6.QtWidgets import QComboBox, QDoubleSpinBox, QFileDialog, QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox, QToolTip
 from PySide6.QtTest import QTest
 
 import oswald_globe.app as app_module
@@ -23,6 +23,7 @@ from oswald_globe.globe_main_window import (
 from oswald_globe.settings_dialog import SettingsDialog
 from oswald_globe.icosphere_grid import IcosphereGrid
 from oswald_globe.project import Project
+from oswald_globe.tools.noise_tool import NoiseBrushCommand
 from oswald_globe.undo_stack import BrushPaintCommand, SelectionBrushCommand, UndoStack
 
 
@@ -313,15 +314,15 @@ def test_create_window(qapp, tmp_path: Path):
         "Settings",
     ]
     assert window._edit_menu is not None
-    assert [action.text() for action in window._edit_menu.actions()] == ["Undo", "Redo"]
-    assert [action.isEnabled() for action in window._edit_menu.actions()] == [False, False]
+    assert [action.text() for action in window._edit_menu.actions()] == ["Undo", "Redo", "Grid", "Optimise grid"]
+    assert [action.isEnabled() for action in window._edit_menu.actions()[:2]] == [False, False]
     assert window._select_menu is not None
-    assert [action.text() for action in window._select_menu.actions()] == ["All", "None", "Invert"]
+    assert [action.text() for action in window._select_menu.actions()] == ["All", "None", "Invert", "By value"]
     assert window._tools_menu is not None
-    assert [action.text() for action in window._tools_menu.actions()] == ["Navigate", "Select", "Paint"]
+    assert [action.text() for action in window._tools_menu.actions()] == ["Navigate", "Select", "Paint", "Noise"]
     assert [action.text() for action in window._tools_menu.actions() if action.isChecked()] == ["Navigate"]
     assert window._filters_menu is not None
-    assert [action.text() for action in window._filters_menu.actions()] == ["Fill"]
+    assert [action.text() for action in window._filters_menu.actions()] == ["Fill", "Noise"]
 
     assert window._legend_menu is not None
     assert window._legend_menu.toolTipsVisible() is True
@@ -609,14 +610,21 @@ def test_paint_tool_selection_shows_options_and_navigate_disposes(qapp):
     try:
         assert window._tools_menu is not None
         tools_menu = window._tools_menu
-        navigate_action, select_action, paint_action = tools_menu.actions()
+        actions_by_text = {action.text(): action for action in tools_menu.actions()}
+        navigate_action = actions_by_text["Navigate"]
+        select_action = actions_by_text["Select"]
+        paint_action = actions_by_text["Paint"]
+        noise_action = actions_by_text["Noise"]
         paint_tool = window._tools["paint"]
+        noise_tool = window._tools["noise"]
         select_tool = window._tools["select"]
 
         assert navigate_action.isChecked() is True
         assert select_action.isChecked() is False
         assert paint_action.isChecked() is False
+        assert noise_action.isChecked() is False
         assert paint_tool.options_dialog is None
+        assert noise_tool.options_dialog is None
         assert select_tool.options_dialog is None
 
         paint_action.trigger()
@@ -737,6 +745,89 @@ def test_paint_tool_selection_shows_options_and_navigate_disposes(qapp):
         window.close()
 
 
+def test_noise_tool_selection_shows_options_and_navigate_disposes(qapp):
+    window = create_window()
+    try:
+        assert window._tools_menu is not None
+        actions_by_text = {action.text(): action for action in window._tools_menu.actions()}
+        navigate_action = actions_by_text["Navigate"]
+        noise_action = actions_by_text["Noise"]
+        noise_tool = window._tools["noise"]
+
+        noise_action.trigger()
+        assert noise_action.isChecked() is True
+        assert navigate_action.isChecked() is False
+        assert noise_tool.options_dialog is not None
+        assert noise_tool.options_dialog.windowTitle() == "Noise Tool Options"
+        assert window.dockWidgetArea(noise_tool.options_dialog) == Qt.DockWidgetArea.RightDockWidgetArea
+
+        double_spins = noise_tool.options_dialog.findChildren(QDoubleSpinBox)
+        ranges = sorted((spin.minimum(), spin.maximum()) for spin in double_spins)
+        assert (-32767.0, 32767.0) in ranges
+        assert (0.0, 100.0) in ranges
+        assert ranges.count((0.0, 5.0)) == 2
+        assert noise_tool.options_dialog.minimum_value_spin.value() == -32767.0
+        assert noise_tool.options_dialog.maximum_value_spin.value() == 32767.0
+        assert noise_tool.options_dialog.frequency_spin.value() == 1.0
+        assert noise_tool.options_dialog.persistence_spin.value() == 0.5
+        assert noise_tool.options_dialog.lacunarity_spin.value() == 2.0
+        assert noise_tool.options_dialog.octaves_spin.value() == 6
+        assert noise_tool.options_dialog.seed_spin.value() == 0
+
+        noise_tool.options_dialog.minimum_value_spin.setValue(-100.0)
+        noise_tool.options_dialog.maximum_value_spin.setValue(200.0)
+        noise_tool.options_dialog.frequency_spin.setValue(0.0)
+        noise_tool.options_dialog.persistence_spin.setValue(1.25)
+        noise_tool.options_dialog.lacunarity_spin.setValue(3.5)
+        noise_tool.options_dialog.octaves_spin.setValue(4)
+        noise_tool.options_dialog.seed_spin.setValue(123)
+        noise_tool.options_dialog.radius_slider.setValue(444)
+        noise_tool.options_dialog.falloff_slider.setValue(11)
+
+        navigate_action.trigger()
+        assert noise_tool.options_dialog is None
+        assert noise_tool.minimum_value() == pytest.approx(-100.0)
+        assert noise_tool.maximum_value() == pytest.approx(200.0)
+        assert noise_tool.frequency() == pytest.approx(0.0)
+        assert noise_tool.persistence() == pytest.approx(1.25)
+        assert noise_tool.lacunarity() == pytest.approx(3.5)
+        assert noise_tool.octaves() == 4
+        assert noise_tool.seed() == 123
+        assert noise_tool.radius_km() == 444
+        assert noise_tool.falloff_percent() == 11
+    finally:
+        window.close()
+
+
+def test_noise_brush_command_paints_constant_simplex_value():
+    grid = IcosphereGrid()
+    grid.subdivide_uniform(1)
+    grid.set_layer("elevation", np.zeros(grid.vertex_count(), dtype=np.float64))
+    lat_deg, lon_deg = grid.vertex_lat_lon()
+
+    command = NoiseBrushCommand(
+        target_lat_deg=float(lat_deg[0]),
+        target_lon_deg=float(lon_deg[0]),
+        radius_km=8000.0,
+        falloff_percent=100.0,
+        minimum_value=50.0,
+        maximum_value=150.0,
+        frequency=0.0,
+        persistence=1.0,
+        lacunarity=2.0,
+        octaves=1,
+        seed=7,
+        mesh_grid=grid,
+        apply_vertex_values=lambda indices, values: grid.get_layer("elevation").values.__setitem__(indices, values),
+    )
+
+    command.redo()
+
+    np.testing.assert_allclose(grid.get_layer("elevation").values[command.vertex_indices], 100.0)
+    command.undo()
+    np.testing.assert_allclose(grid.get_layer("elevation").values, 0.0)
+
+
 @pytest.mark.parametrize(
     ("paint_mode", "paint_value", "expected_inner"),
     [
@@ -801,7 +892,7 @@ def test_brush_command_applies_without_selection_when_has_selection_is_false():
     grid.subdivide_uniform(1)
     original = np.linspace(0.0, 100.0, grid.vertex_count(), dtype=np.float64)
     grid.set_layer("elevation", original.copy())
-    grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values[:] = 0.0
+    grid.selection_values[:] = 0.0
 
     lat_deg, lon_deg = grid.vertex_lat_lon()
     target_index = 0
@@ -840,8 +931,8 @@ def test_brush_command_multiplies_effect_by_selection_status():
     radius_km = 8000.0
     falloff_percent = 50.0
 
-    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-    selection.values[:] = 0.0
+    selection = grid.selection_values
+    selection[:] = 0.0
 
     center = grid.vertices[target_index]
     distances = np.arccos(np.clip(grid.vertices @ center, -1.0, 1.0))
@@ -849,7 +940,7 @@ def test_brush_command_multiplies_effect_by_selection_status():
     selected_indices = np.flatnonzero(distances <= outer_radius + 1e-9)
     assert selected_indices.size > 0
 
-    selection.values[selected_indices] = np.linspace(0.25, 1.0, selected_indices.size, dtype=np.float64)
+    selection[selected_indices] = np.linspace(0.25, 1.0, selected_indices.size, dtype=np.float64)
     assert grid.has_selection is True
 
     reference_command = BrushPaintCommand(
@@ -875,7 +966,7 @@ def test_brush_command_multiplies_effect_by_selection_status():
 
     command.redo()
 
-    selection_weights = selection.values[command.vertex_indices]
+    selection_weights = selection[command.vertex_indices]
     unselected_mask = selection_weights == 0.0
     selected_mask = selection_weights > 0.0
 
@@ -889,8 +980,8 @@ def test_brush_command_multiplies_effect_by_selection_status():
 def test_selection_brush_command_marks_vertices_with_soft_falloff():
     grid = IcosphereGrid()
     grid.subdivide_uniform(1)
-    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-    selection.values[:] = 0.0
+    selection = grid.selection_values
+    selection[:] = 0.0
 
     lat_deg, lon_deg = grid.vertex_lat_lon()
     target_index = 0
@@ -905,7 +996,7 @@ def test_selection_brush_command_marks_vertices_with_soft_falloff():
         replace_existing=False,
         erase_selection=False,
         mesh_grid=grid,
-        apply_selection_values=lambda indices, values: selection.values.__setitem__(indices, values),
+        apply_selection_values=lambda indices, values: selection.__setitem__(indices, values),
     )
 
     center = grid.vertices[target_index]
@@ -920,19 +1011,19 @@ def test_selection_brush_command_marks_vertices_with_soft_falloff():
 
     command.redo()
 
-    np.testing.assert_allclose(selection.values[inner_mask], 1.0)
+    np.testing.assert_allclose(selection[inner_mask], 1.0)
     expected_transition = (outer_radius - distances[transition_mask]) / (outer_radius - inner_radius)
-    np.testing.assert_allclose(selection.values[transition_mask], expected_transition)
+    np.testing.assert_allclose(selection[transition_mask], expected_transition)
 
     command.undo()
-    np.testing.assert_allclose(selection.values, 0.0)
+    np.testing.assert_allclose(selection, 0.0)
 
 
 def test_selection_brush_command_can_replace_existing_selection():
     grid = IcosphereGrid()
     grid.subdivide_uniform(1)
-    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-    selection.values[:] = 1.0
+    selection = grid.selection_values
+    selection[:] = 1.0
 
     lat_deg, lon_deg = grid.vertex_lat_lon()
     target_index = 0
@@ -945,24 +1036,24 @@ def test_selection_brush_command_can_replace_existing_selection():
         replace_existing=True,
         erase_selection=False,
         mesh_grid=grid,
-        apply_selection_values=lambda indices, values: selection.values.__setitem__(indices, values),
+        apply_selection_values=lambda indices, values: selection.__setitem__(indices, values),
     )
 
     command.redo()
 
     assert command.vertex_indices.shape == (grid.vertex_count(),)
-    assert np.any(selection.values == 0.0)
-    assert np.max(selection.values) == pytest.approx(1.0)
+    assert np.any(selection == 0.0)
+    assert np.max(selection) == pytest.approx(1.0)
 
     command.undo()
-    np.testing.assert_allclose(selection.values, 1.0)
+    np.testing.assert_allclose(selection, 1.0)
 
 
 def test_selection_brush_command_can_erase_without_clearing_unaffected_vertices():
     grid = IcosphereGrid()
     grid.subdivide_uniform(1)
-    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-    selection.values[:] = 1.0
+    selection = grid.selection_values
+    selection[:] = 1.0
 
     lat_deg, lon_deg = grid.vertex_lat_lon()
     target_index = 0
@@ -975,7 +1066,7 @@ def test_selection_brush_command_can_erase_without_clearing_unaffected_vertices(
         replace_existing=False,
         erase_selection=True,
         mesh_grid=grid,
-        apply_selection_values=lambda indices, values: selection.values.__setitem__(indices, values),
+        apply_selection_values=lambda indices, values: selection.__setitem__(indices, values),
     )
 
     command.redo()
@@ -983,17 +1074,17 @@ def test_selection_brush_command_can_erase_without_clearing_unaffected_vertices(
     assert np.any(command.after_values == 0.0)
     unaffected = np.setdiff1d(np.arange(grid.vertex_count(), dtype=np.intp), command.vertex_indices)
     if unaffected.size:
-        np.testing.assert_allclose(selection.values[unaffected], 1.0)
+        np.testing.assert_allclose(selection[unaffected], 1.0)
 
     command.undo()
-    np.testing.assert_allclose(selection.values, 1.0)
+    np.testing.assert_allclose(selection, 1.0)
 
 
 def test_selection_layer_command_bulk_updates_and_undo():
     grid = IcosphereGrid()
     grid.subdivide_uniform(1)
-    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-    selection.values[:] = np.linspace(0.0, 1.0, grid.vertex_count(), dtype=np.float64)
+    selection = grid.selection_values
+    selection[:] = np.linspace(0.0, 1.0, grid.vertex_count(), dtype=np.float64)
 
     from oswald_globe.undo_stack import SelectionLayerCommand
 
@@ -1001,14 +1092,14 @@ def test_selection_layer_command_bulk_updates_and_undo():
     command = SelectionLayerCommand(
         mesh_grid=grid,
         after_values=target,
-        apply_selection_values=lambda indices, values: selection.values.__setitem__(indices, values),
+        apply_selection_values=lambda indices, values: selection.__setitem__(indices, values),
     )
 
     command.redo()
-    np.testing.assert_allclose(selection.values, 1.0)
+    np.testing.assert_allclose(selection, 1.0)
 
     command.undo()
-    np.testing.assert_allclose(selection.values, np.linspace(0.0, 1.0, grid.vertex_count(), dtype=np.float64))
+    np.testing.assert_allclose(selection, np.linspace(0.0, 1.0, grid.vertex_count(), dtype=np.float64))
 
 
 def test_paint_brush_release_pushes_undo_command(qapp, monkeypatch: pytest.MonkeyPatch):
@@ -1265,7 +1356,7 @@ def test_select_tool_applies_selection_and_shows_brush_hover(qapp, monkeypatch: 
         widget.mouseMoveEvent(SelectEvent(12.0, 34.0))
         widget.mouseReleaseEvent(SelectEvent(12.0, 34.0))
 
-        selection = widget.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values
+        selection = widget.mesh_grid.selection_values
         assert widget._hover_target_lat == pytest.approx(0.5)
         assert widget._hover_target_lon == pytest.approx(-1.0)
         assert widget.cursor().shape() == Qt.CursorShape.BlankCursor
@@ -1317,8 +1408,8 @@ def test_select_tool_mouse_down_replaces_existing_selection_without_shift(qapp, 
         widget.set_undo_stack(UndoStack())
         widget.set_brush_command_factory(window._create_select_command)
 
-        selection = widget.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-        selection.values[:] = 1.0
+        selection = widget.mesh_grid.selection_values
+        selection[:] = 1.0
 
         monkeypatch.setattr(
             "oswald_globe.globe_widget.unproject_point",
@@ -1346,8 +1437,8 @@ def test_select_tool_mouse_down_replaces_existing_selection_without_shift(qapp, 
 
         widget.mousePressEvent(SelectPressEvent(12.0, 34.0))
 
-        assert np.any(selection.values == 0.0)
-        assert np.max(selection.values) == pytest.approx(1.0)
+        assert np.any(selection == 0.0)
+        assert np.max(selection) == pytest.approx(1.0)
     finally:
         window.close()
 
@@ -1360,14 +1451,14 @@ def test_select_tool_mouse_down_with_shift_adds_to_existing_selection(qapp, monk
         widget.set_undo_stack(UndoStack())
         widget.set_brush_command_factory(window._create_select_command)
 
-        selection = widget.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-        selection.values[:] = 0.0
+        selection = widget.mesh_grid.selection_values
+        selection[:] = 0.0
         lat_deg, lon_deg = widget.mesh_grid.vertex_lat_lon()
         target_index = 0
         center = widget.mesh_grid.vertices[target_index]
         distances = np.arccos(np.clip(widget.mesh_grid.vertices @ center, -1.0, 1.0))
         far_index = int(np.argmax(distances))
-        selection.values[far_index] = 0.5
+        selection[far_index] = 0.5
 
         monkeypatch.setattr(
             "oswald_globe.globe_widget.unproject_point",
@@ -1395,8 +1486,8 @@ def test_select_tool_mouse_down_with_shift_adds_to_existing_selection(qapp, monk
 
         widget.mousePressEvent(SelectShiftPressEvent(12.0, 34.0))
 
-        assert selection.values[far_index] == pytest.approx(0.5)
-        assert np.max(selection.values) == pytest.approx(1.0)
+        assert selection[far_index] == pytest.approx(0.5)
+        assert np.max(selection) == pytest.approx(1.0)
     finally:
         window.close()
 
@@ -1409,8 +1500,8 @@ def test_select_tool_mouse_down_with_alt_erases_without_clearing_other_selection
         widget.set_undo_stack(UndoStack())
         widget.set_brush_command_factory(window._create_select_command)
 
-        selection = widget.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-        selection.values[:] = 1.0
+        selection = widget.mesh_grid.selection_values
+        selection[:] = 1.0
         lat_deg, lon_deg = widget.mesh_grid.vertex_lat_lon()
         target_index = 0
         center = widget.mesh_grid.vertices[target_index]
@@ -1443,8 +1534,8 @@ def test_select_tool_mouse_down_with_alt_erases_without_clearing_other_selection
 
         widget.mousePressEvent(SelectAltPressEvent(12.0, 34.0))
 
-        assert np.any(selection.values == 0.0)
-        assert selection.values[far_index] == pytest.approx(1.0)
+        assert np.any(selection == 0.0)
+        assert selection[far_index] == pytest.approx(1.0)
     finally:
         window.close()
 
@@ -1457,8 +1548,8 @@ def test_select_tool_alt_drag_erases_selection_under_outer_circle(qapp, monkeypa
         widget.set_undo_stack(UndoStack())
         widget.set_brush_command_factory(window._create_select_command)
 
-        selection = widget.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-        selection.values[:] = 1.0
+        selection = widget.mesh_grid.selection_values
+        selection[:] = 1.0
 
         monkeypatch.setattr(
             "oswald_globe.globe_widget.unproject_point",
@@ -1486,7 +1577,7 @@ def test_select_tool_alt_drag_erases_selection_under_outer_circle(qapp, monkeypa
 
         widget.mouseMoveEvent(SelectAltDragEvent(12.0, 34.0))
 
-        assert np.any(selection.values == 0.0)
+        assert np.any(selection == 0.0)
     finally:
         window.close()
 
@@ -1494,27 +1585,27 @@ def test_select_tool_alt_drag_erases_selection_under_outer_circle(qapp, monkeypa
 def test_select_menu_actions_update_selection_and_support_undo(qapp):
     window = create_window()
     try:
-        selection = window.viewer.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-        selection.values[:] = np.linspace(0.0, 1.0, selection.values.size, dtype=np.float64)
-        original = selection.values.copy()
+        selection = window.viewer.mesh_grid.selection_values
+        selection[:] = np.linspace(0.0, 1.0, selection.size, dtype=np.float64)
+        original = selection.copy()
 
         window.select_all_vertices()
-        np.testing.assert_allclose(selection.values, 1.0)
+        np.testing.assert_allclose(selection, 1.0)
 
         window._undo_stack.undo()
-        np.testing.assert_allclose(selection.values, original)
+        np.testing.assert_allclose(selection, original)
 
         window.select_no_vertices()
-        np.testing.assert_allclose(selection.values, 0.0)
+        np.testing.assert_allclose(selection, 0.0)
 
         window._undo_stack.undo()
-        np.testing.assert_allclose(selection.values, original)
+        np.testing.assert_allclose(selection, original)
 
         window.invert_vertex_selection()
-        np.testing.assert_allclose(selection.values, 1.0 - original)
+        np.testing.assert_allclose(selection, 1.0 - original)
 
         window._undo_stack.undo()
-        np.testing.assert_allclose(selection.values, original)
+        np.testing.assert_allclose(selection, original)
     finally:
         window.close()
 
@@ -1524,17 +1615,17 @@ def test_select_by_value_without_existing_selection_selects_globally_and_undoes(
     try:
         mesh_grid = window.viewer.mesh_grid
         assert mesh_grid is not None
-        selection = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-        selection.values[:] = 0.0
+        selection = mesh_grid.selection_values
+        selection[:] = 0.0
         elevation = mesh_grid.get_layer("elevation")
         elevation.values[:] = np.linspace(-32767.0, 32767.0, mesh_grid.vertex_count(), dtype=np.float64)
 
         expected = ((elevation.values >= -1024.0) & (elevation.values <= 1024.0)).astype(np.float64)
         window.select_vertices_by_value_range(-1024.0, 1024.0)
-        np.testing.assert_allclose(selection.values, expected)
+        np.testing.assert_allclose(selection, expected)
 
         window._undo_stack.undo()
-        np.testing.assert_allclose(selection.values, 0.0)
+        np.testing.assert_allclose(selection, 0.0)
     finally:
         window.close()
 
@@ -1544,10 +1635,10 @@ def test_select_by_value_with_existing_selection_only_filters_selected_vertices(
     try:
         mesh_grid = window.viewer.mesh_grid
         assert mesh_grid is not None
-        selection = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-        selection.values[:] = 0.0
+        selection = mesh_grid.selection_values
+        selection[:] = 0.0
         selected_indices = np.array([0, 1, 2, 3], dtype=np.intp)
-        selection.values[selected_indices] = np.array([0.2, 0.4, 0.6, 0.8], dtype=np.float64)
+        selection[selected_indices] = np.array([0.2, 0.4, 0.6, 0.8], dtype=np.float64)
 
         elevation = mesh_grid.get_layer("elevation")
         elevation.values[:] = 9999.0
@@ -1558,17 +1649,17 @@ def test_select_by_value_with_existing_selection_only_filters_selected_vertices(
         unselected_in_range_index = 4
         elevation.values[unselected_in_range_index] = 100.0
 
-        before = selection.values.copy()
+        before = selection.copy()
         window.select_vertices_by_value_range(-1000.0, 1000.0)
 
         expected = np.zeros_like(before)
         expected[1] = 1.0
         expected[2] = 1.0
-        np.testing.assert_allclose(selection.values, expected)
-        assert selection.values[unselected_in_range_index] == 0.0
+        np.testing.assert_allclose(selection, expected)
+        assert selection[unselected_in_range_index] == 0.0
 
         window._undo_stack.undo()
-        np.testing.assert_allclose(selection.values, before)
+        np.testing.assert_allclose(selection, before)
     finally:
         window.close()
 
@@ -1578,8 +1669,8 @@ def test_select_by_value_dialog_cancel_is_noop(qapp, monkeypatch: pytest.MonkeyP
     try:
         mesh_grid = window.viewer.mesh_grid
         assert mesh_grid is not None
-        selection = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-        before = selection.values.copy()
+        selection = mesh_grid.selection_values
+        before = selection.copy()
 
         class CancelDialog:
             def __init__(self, _parent):
@@ -1591,7 +1682,7 @@ def test_select_by_value_dialog_cancel_is_noop(qapp, monkeypatch: pytest.MonkeyP
         monkeypatch.setattr(globe_main_window, "SelectByValueDialog", CancelDialog)
         window.select_vertices_by_value_dialog()
 
-        np.testing.assert_allclose(selection.values, before)
+        np.testing.assert_allclose(selection, before)
         assert not window._undo_stack.can_undo()
     finally:
         window.close()
@@ -1616,11 +1707,11 @@ def test_grid_menu_requires_selection_and_tracks_undo_redo(qapp, tmp_path: Path)
         window.invert_vertex_selection()
         assert grid_action.isEnabled()
 
-        selection = window.viewer.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-        selection.values[:] = 0.0
+        selection = window.viewer.mesh_grid.selection_values
+        selection[:] = 0.0
         window._edit_menu.aboutToShow.emit()
         assert not grid_action.isEnabled()
-        selection.values[0] = 0.01
+        selection[0] = 0.01
         window._edit_menu.aboutToShow.emit()
         assert grid_action.isEnabled()
 
@@ -1847,8 +1938,8 @@ def test_grid_detail_actions_update_mesh_and_vertex_count_label(qapp, tmp_path: 
         mesh_grid = window.viewer.gl_widget.mesh_grid
         assert mesh_grid is not None
 
-        selection = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-        selection.values[:] = 1.0
+        selection = mesh_grid.selection_values
+        selection[:] = 1.0
 
         original_vertex_count = mesh_grid.vertex_count()
         window.add_grid_detail()
@@ -2107,7 +2198,7 @@ def test_project_round_trip_preserves_mesh_geometry_layers_and_metadata(tmp_path
         legend="grayscale",
         z_index=3,
     )
-    grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values[:] = np.linspace(
+    grid.selection_values[:] = np.linspace(
         0.0,
         1.0,
         grid.vertex_count(),
@@ -2128,8 +2219,8 @@ def test_project_round_trip_preserves_mesh_geometry_layers_and_metadata(tmp_path
         grid.get_layer("elevation").values,
     )
     np.testing.assert_allclose(
-        loaded.grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values,
-        grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values,
+        loaded.grid.selection_values,
+        grid.selection_values,
     )
     loaded_temperature = loaded.grid.get_layer("temperature")
     original_temperature = grid.get_layer("temperature")

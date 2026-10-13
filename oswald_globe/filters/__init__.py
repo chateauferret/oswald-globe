@@ -8,10 +8,12 @@ import pkgutil
 
 from .fill_filter import FillFilter
 from .filter import Filter
+from .noise_filter import NoiseFilter
 
 __all__ = [
     "Filter",
     "FillFilter",
+    "NoiseFilter",
     "discover_filters",
     "load_filters",
 ]

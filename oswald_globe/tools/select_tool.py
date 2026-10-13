@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Optional
 import numpy as np
 from PySide6.QtWidgets import QWidget
 
-from oswald_globe.brush_paint_command import BrushCommand
+from oswald_globe.tools.brush_command import BrushCommand
 from oswald_globe.icosphere_grid import IcosphereGrid
 
 from .tool import BrushTool
@@ -59,8 +59,7 @@ class SelectionBrushCommand(BrushCommand):
             self.falloff_percent,
         )
 
-        layer = self.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-        source_values = layer.values.astype(np.float64, copy=True)
+        source_values = self.mesh_grid.selection_values.astype(np.float64, copy=True)
         if self.replace_existing:
             before_values = source_values
             after_values = np.zeros_like(before_values)
@@ -108,7 +107,7 @@ class SelectionLayerCommand:
 
     def __post_init__(self) -> None:
         self.vertex_indices = np.arange(self.mesh_grid.vertex_count(), dtype=np.intp)
-        self.before_values = self.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values.astype(
+        self.before_values = self.mesh_grid.selection_values.astype(
             np.float64,
             copy=True,
         )

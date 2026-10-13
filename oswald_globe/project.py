@@ -17,7 +17,8 @@ class Project:
     """Single-file snapshot of a globe raster, mesh geometry, and mesh layers."""
 
     FILE_SUFFIX = ".ogp"
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
+    SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2})
 
     raster: np.ndarray
     grid: IcosphereGrid
@@ -61,10 +62,10 @@ class Project:
         path = Path(path)
         with np.load(path, allow_pickle=False) as archive:
             schema_version = int(np.asarray(archive["schema_version"], dtype=np.int64).item())
-            if schema_version != cls.SCHEMA_VERSION:
+            if schema_version not in cls.SUPPORTED_SCHEMA_VERSIONS:
                 raise ValueError(
                     f"Unsupported project schema version {schema_version}; "
-                    f"expected {cls.SCHEMA_VERSION}."
+                    f"expected one of {sorted(cls.SUPPORTED_SCHEMA_VERSIONS)}."
                 )
 
             raster = np.asarray(archive["raster"], dtype=np.float32)
@@ -86,6 +87,10 @@ class Project:
                 ),
                 "layer_metadata": layer_metadata,
             }
+            if "grid_selection_values" in archive:
+                grid_state["selection_values"] = np.asarray(
+                    archive["grid_selection_values"], dtype=np.float64
+                )
             for descriptor in layer_metadata:
                 values_key = str(descriptor["values_key"])
                 grid_state[values_key] = np.asarray(

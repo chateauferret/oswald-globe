@@ -9,6 +9,7 @@ import numpy as np
 from PySide6.QtCore import Signal, Slot
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import QDialogButtonBox, QWidget
+from oswald_globe.algorithms.apply_value import ApplyValue
 
 from oswald_globe.icosphere_grid import IcosphereGrid
 from oswald_globe.tools.paint_tool import PaintToolOptionsDialog
@@ -73,30 +74,15 @@ class FillFilterCommand:
         self.vertex_indices = np.arange(self.mesh_grid.vertex_count(), dtype=np.intp)
         layer = self.mesh_grid.get_layer("elevation")
         self.before_values = layer.values.astype(np.float64, copy=True)
-        selection_values = self.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values.astype(np.float64, copy=True)
+        selection_values = self.mesh_grid.selection_values.astype(np.float64, copy=True)
         if not np.any(selection_values > 0.0):
             selection_values = np.ones_like(self.before_values, dtype=np.float64)
-        transformed_values = self._apply_fill_mode(self.before_values, float(self.fill_value), str(self.fill_mode))
-        self.after_values = self.before_values + selection_values * (transformed_values - self.before_values)
-
-    @staticmethod
-    def _apply_fill_mode(existing_values: np.ndarray, fill_value: float, fill_mode: str) -> np.ndarray:
-        mode = str(fill_mode)
-        if mode == "Replace":
-            return np.full(existing_values.shape, fill_value, dtype=np.float64)
-        if mode == "Add":
-            return existing_values + fill_value
-        if mode == "Subtract":
-            return existing_values - fill_value
-        if mode == "Minimum":
-            return np.minimum(existing_values, fill_value)
-        if mode == "Maximum":
-            return np.maximum(existing_values, fill_value)
-        if mode == "Multiply":
-            return existing_values * fill_value
-        if mode == "Average":
-            return (existing_values + fill_value) / 2.0
-        raise ValueError(f"Unsupported fill mode: {fill_mode!r}")
+        self.after_values = ApplyValue.apply(
+            self.before_values,
+            float(self.fill_value),
+            str(self.fill_mode),
+            weights=selection_values,
+        )
 
     def redo(self) -> None:
         self.apply_vertex_values(self.vertex_indices, self.after_values)

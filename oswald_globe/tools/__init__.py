@@ -7,6 +7,7 @@ import inspect
 import pkgutil
 from typing import Callable, TypeVar
 
+from .noise_tool import NoiseTool, NoiseToolOptionsDialog
 from .paint_tool import PaintTool, PaintToolOptionsDialog
 from .select_tool import SelectTool, SelectToolOptionsDialog
 from .tool import BrushTool, NavigateTool, Tool
@@ -14,6 +15,8 @@ from .tool import BrushTool, NavigateTool, Tool
 __all__ = [
     "BrushTool",
     "NavigateTool",
+    "NoiseTool",
+    "NoiseToolOptionsDialog",
     "PaintTool",
     "PaintToolOptionsDialog",
     "SelectTool",
@@ -23,7 +26,7 @@ __all__ = [
     "load_tools",
 ]
 
-_TOOL_ORDER = {"navigate": 0, "select": 1, "paint": 2}
+_TOOL_ORDER = {"navigate": 0, "select": 1, "paint": 2, "noise": 3}
 
 
 def _normalize_tool_name(name: str) -> str:

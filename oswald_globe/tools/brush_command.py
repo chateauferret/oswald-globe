@@ -1,11 +1,10 @@
-"""Brush-based mesh edit commands with undo/redo support."""
+"""Shared brush-command base classes for mesh edit tools."""
 
 from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable
 
 import numpy as np
 
@@ -14,13 +13,7 @@ from oswald_globe.icosphere_grid import IcosphereGrid
 
 @dataclass(slots=True)
 class BrushCommand(ABC):
-    """Common base for undoable commands that paint a lat/lon brush stroke
-    onto a mesh-backed layer.
-
-    Subclasses implement `_capture_values` to compute the affected vertex
-    indices and their before/after values, and `_apply` to write a set of
-    values back onto their target layer.
-    """
+    """Common base for undoable commands that paint a lat/lon brush stroke onto a mesh-backed layer."""
 
     target_lat_deg: float
     target_lon_deg: float
@@ -85,20 +78,4 @@ class BrushCommand(ABC):
         self._apply(self.vertex_indices, self.before_values)
 
 
-def __getattr__(name: str):
-    if name == "BrushPaintCommand":
-        from oswald_globe.tools.paint_tool import BrushPaintCommand
-
-        return BrushPaintCommand
-    if name == "SelectionBrushCommand":
-        from oswald_globe.tools.select_tool import SelectionBrushCommand
-
-        return SelectionBrushCommand
-    if name == "SelectionLayerCommand":
-        from oswald_globe.tools.select_tool import SelectionLayerCommand
-
-        return SelectionLayerCommand
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-__all__ = ["BrushCommand", "BrushPaintCommand", "SelectionBrushCommand", "SelectionLayerCommand"]
+__all__ = ["BrushCommand"]

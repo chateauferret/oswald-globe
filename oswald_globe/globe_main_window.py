@@ -781,7 +781,7 @@ class GlobeMainWindow(QMainWindow):
         mesh_grid = self.viewer.gl_widget.mesh_grid
         if mesh_grid is None:
             raise RuntimeError("Invert Selection requires a mesh-backed globe.")
-        selection_values = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values
+        selection_values = mesh_grid.selection_values
         command = self._create_selection_layer_command(1.0 - selection_values)
         self._undo_stack.push(command)
 
@@ -791,7 +791,7 @@ class GlobeMainWindow(QMainWindow):
         upper = float(max(minimum, maximum))
         data_values = mesh_grid.get_layer("elevation").values
         in_range = np.isfinite(data_values) & (data_values >= lower) & (data_values <= upper)
-        selection_values = mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values
+        selection_values = mesh_grid.selection_values
         currently_selected = selection_values > 0.0
 
         after_values = np.zeros(mesh_grid.vertex_count(), dtype=np.float64)

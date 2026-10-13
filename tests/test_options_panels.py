@@ -6,7 +6,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialogButtonBox, QDockWidget, QMainWindow, QWidget
 
 from oswald_globe.filters.fill_filter import FillFilter, FillFilterOptionsDialog
+from oswald_globe.filters.noise_filter import NoiseFilter
 from oswald_globe.icosphere_grid import IcosphereGrid
+from oswald_globe.tools.noise_tool import NoiseToolOptionsDialog
 from oswald_globe.tools.paint_tool import PaintToolOptionsDialog
 from oswald_globe.tools.select_tool import SelectToolOptionsDialog
 from oswald_globe.undo_stack import UndoStack
@@ -121,6 +123,101 @@ def test_fill_panel_apply_ok_cancel_and_reopen_preserve_behavior(qapp):
         assert filter_obj.options_dialog.value_spin.value() == 99
     finally:
         filter_obj.dispose_options_dialog()
+        window.close()
+        window.deleteLater()
+
+
+def test_noise_panel_apply_ok_cancel_and_reopen_preserve_behavior(qapp):
+    window = QMainWindow()
+    grid = IcosphereGrid()
+    grid.set_layer("elevation", np.zeros(grid.vertex_count(), dtype=np.float64))
+    undo_stack = UndoStack()
+    window.viewer = SimpleNamespace(
+        gl_widget=SimpleNamespace(
+            mesh_grid=grid,
+            _undo_stack=undo_stack,
+            apply_mesh_vertex_values=lambda indices, values: grid.get_layer("elevation").values.__setitem__(
+                indices, values
+            ),
+        )
+    )
+    filter_obj = NoiseFilter(window)
+    try:
+        window.show()
+        filter_obj.show_options_dialog()
+        panel = filter_obj.options_dialog
+        assert panel is not None
+        buttons = panel.findChild(QDialogButtonBox)
+        assert buttons is not None
+        panel.minimum_value_spin.setValue(50.0)
+        panel.maximum_value_spin.setValue(150.0)
+        panel.frequency_spin.setValue(0.0)
+        panel.persistence_spin.setValue(1.0)
+        panel.lacunarity_spin.setValue(2.0)
+        panel.octaves_spin.setValue(1)
+        panel.seed_spin.setValue(7)
+
+        panel._apply_button.click()
+        np.testing.assert_allclose(grid.get_layer("elevation").values, 100.0)
+        assert panel.isVisible()
+        undo_stack.undo()
+        np.testing.assert_allclose(grid.get_layer("elevation").values, 0.0)
+        undo_stack.redo()
+        np.testing.assert_allclose(grid.get_layer("elevation").values, 100.0)
+
+        panel.maximum_value_spin.setValue(250.0)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).click()
+        np.testing.assert_allclose(grid.get_layer("elevation").values, 150.0)
+        assert panel.isHidden()
+        filter_obj.show_options_dialog()
+        assert filter_obj.options_dialog is panel
+        assert panel.maximum_value_spin.value() == 250.0
+        panel.seed_spin.setValue(99)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).click()
+        np.testing.assert_allclose(grid.get_layer("elevation").values, 150.0)
+        undo_stack.undo()
+        np.testing.assert_allclose(grid.get_layer("elevation").values, 100.0)
+
+        filter_obj.dispose_options_dialog()
+        assert filter_obj.options_dialog is None
+        filter_obj.show_options_dialog()
+        reopened = filter_obj.options_dialog
+        assert reopened is not None
+        assert reopened.seed_spin.value() == 99
+        assert reopened.maximum_value_spin.value() == 250.0
+    finally:
+        filter_obj.dispose_options_dialog()
+        window.close()
+        window.deleteLater()
+
+
+def test_noise_tool_options_panel_is_dockable_and_retain_values_when_floating(qapp):
+    window = QMainWindow()
+    window.resize(1000, 600)
+    panel = NoiseToolOptionsDialog(window)
+    try:
+        assert isinstance(panel, QDockWidget)
+        window.show()
+        panel.show()
+        panel.minimum_value_spin.setValue(-123.0)
+        panel.maximum_value_spin.setValue(456.0)
+        panel.frequency_spin.setValue(7.5)
+        panel.persistence_spin.setValue(1.5)
+        panel.lacunarity_spin.setValue(2.5)
+        panel.octaves_spin.setValue(8)
+        panel.seed_spin.setValue(99)
+        panel.setFloating(True)
+        qapp.processEvents()
+        assert panel.isFloating()
+        assert panel.minimum_value_spin.value() == -123.0
+        assert panel.maximum_value_spin.value() == 456.0
+        assert panel.frequency_spin.value() == 7.5
+        assert panel.persistence_spin.value() == 1.5
+        assert panel.lacunarity_spin.value() == 2.5
+        assert panel.octaves_spin.value() == 8
+        assert panel.seed_spin.value() == 99
+    finally:
+        panel.close()
         window.close()
         window.deleteLater()
 

@@ -243,7 +243,7 @@ class GlobeGLWidget(QOpenGLWidget):
         self.vel_x = 0.0
         self.vel_y = 0.0
 
-        # Active tool state ("navigate" or "paint") and paint brush preview parameters.
+        # Active tool state and brush preview parameters.
         self.tool_mode = "navigate"
         self.paint_angular_radius = math.radians(5.0)
         self.paint_dropoff_percent = 50.0
@@ -458,8 +458,7 @@ class GlobeGLWidget(QOpenGLWidget):
                 f"got {indices.shape} and {new_values.shape}."
             )
 
-        layer = self.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-        layer.values[indices] = new_values
+        self.mesh_grid.selection_values[indices] = new_values
         self.update()
 
     def _get_colormap(self):
@@ -825,8 +824,8 @@ class GlobeGLWidget(QOpenGLWidget):
     # ---------------- Tool Mode & Paint Brush Preview ----------------
 
     def set_tool_mode(self, mode: str) -> None:
-        """Switch the active interaction tool ("navigate", "select", or "paint")."""
-        mode = mode if mode in ("navigate", "select", "paint") else "navigate"
+        """Switch the active interaction tool."""
+        mode = mode if mode in ("navigate", "select", "paint", "noise") else "navigate"
         if mode == self.tool_mode:
             return
         self.tool_mode = mode
@@ -848,7 +847,7 @@ class GlobeGLWidget(QOpenGLWidget):
         radius_deg = min(89.0, max(0.0, float(radius_km) / 111.0))
         self.paint_angular_radius = math.radians(radius_deg)
         self.paint_dropoff_percent = min(100.0, max(0.0, float(dropoff_percent)))
-        if self.tool_mode in ("paint", "select"):
+        if self.tool_mode in ("paint", "select", "noise"):
             self.update()
 
     def set_undo_stack(self, undo_stack: Optional[UndoStack]) -> None:
@@ -874,7 +873,7 @@ class GlobeGLWidget(QOpenGLWidget):
         if self._middle_dragging:
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
-        if self.tool_mode in ("paint", "select"):
+        if self.tool_mode in ("paint", "select", "noise"):
             if self._mouse_over_globe:
                 self.setCursor(Qt.CursorShape.BlankCursor)
             else:
@@ -1089,7 +1088,7 @@ class GlobeGLWidget(QOpenGLWidget):
         """Draw the paint brush preview circles on the surface of the globe."""
         if self.is_auto_spin:
             return
-        if self.tool_mode not in ("paint", "select") or not self._mouse_over_globe:
+        if self.tool_mode not in ("paint", "select", "noise") or not self._mouse_over_globe:
             return
         if self.paint_angular_radius <= 0 or self.line_program <= 0:
             return
@@ -1133,7 +1132,7 @@ class GlobeGLWidget(QOpenGLWidget):
             return
 
         selection_values = np.clip(
-            self.mesh_grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME).values,
+            self.mesh_grid.selection_values,
             0.0,
             1.0,
         )
@@ -1261,7 +1260,7 @@ class GlobeGLWidget(QOpenGLWidget):
             QToolTip.hideText()
             return
 
-        if self.tool_mode in ("paint", "select") and (event.buttons() & Qt.MouseButton.LeftButton):
+        if self.tool_mode in ("paint", "select", "noise") and (event.buttons() & Qt.MouseButton.LeftButton):
             self._apply_brush_at_position(
                 pt,
                 erase_selection=self.tool_mode == "select" and self._event_has_alt_modifier(event),
@@ -1286,7 +1285,7 @@ class GlobeGLWidget(QOpenGLWidget):
             self.update()
         else:
             self._update_tooltip(x, y)
-            if self.tool_mode in ("paint", "select"):
+            if self.tool_mode in ("paint", "select", "noise"):
                 self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent):
@@ -1305,7 +1304,7 @@ class GlobeGLWidget(QOpenGLWidget):
             QToolTip.hideText()
             return
 
-        if event.button() == Qt.MouseButton.LeftButton and self.tool_mode == "paint":
+        if event.button() == Qt.MouseButton.LeftButton and self.tool_mode in ("paint", "noise"):
             self._apply_brush_at_position(pt)
             self.update()
             return
@@ -1419,7 +1418,7 @@ class GlobeGLWidget(QOpenGLWidget):
         self._mouse_over_globe = False
         self._select_alt_mode = False
         super().leaveEvent(event)
-        if self.tool_mode in ("paint", "select"):
+        if self.tool_mode in ("paint", "select", "noise"):
             self.update()
 
     def keyPressEvent(self, event) -> None:

@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from oswald_globe.icosphere_grid import IcosphereBuildCancelled, IcosphereGrid, LayerLegend, _xyz_to_latlon
+from oswald_globe.layer import DataLayer, ElevationLayer
 
 
 def _bump_map(height=181, width=361):
@@ -32,8 +33,7 @@ def test_uniform_subdivision_counts():
 def test_subdivide_selected_faces_once_refines_selected_triangles():
     grid = IcosphereGrid()
     grid.subdivide_uniform(1)
-    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-    selection.values[:] = 1.0
+    grid.selection_values[:] = 1.0
 
     subdivided_faces = grid.subdivide_selected_faces_once()
 
@@ -49,7 +49,7 @@ def test_repeated_local_subdivision_stays_balanced_and_manifold():
     grid = IcosphereGrid()
     grid.subdivide_uniform(2)
     original_faces = list(grid._red_leaves())
-    grid.get_layer(grid.SELECTION_LAYER_NAME).values[list(original_faces[0].v)] = 1.0
+    grid.selection_values[list(original_faces[0].v)] = 1.0
     grid.add_layer("constant", np.full(grid.vertex_count(), 42.0))
     grid.dual_cell_line_segments()
 
@@ -77,9 +77,8 @@ def test_repeated_local_subdivision_stays_balanced_and_manifold():
 def test_local_subdivision_refines_overcrowded_transition_cells():
     grid = IcosphereGrid()
     grid.subdivide_uniform(2)
-    selection = grid.get_layer(grid.SELECTION_LAYER_NAME)
-    selection.values[:] = 1.0
-    selection.values[grid._red_leaves()[0].v[0]] = 0.0
+    grid.selection_values[:] = 1.0
+    grid.selection_values[grid._red_leaves()[0].v[0]] = 0.0
 
     grid.subdivide_selected_faces_once()
 
@@ -92,9 +91,10 @@ def test_local_subdivision_uses_shared_spherical_edge_midpoints():
     grid = IcosphereGrid()
     grid.subdivide_uniform(1)
     face = grid._red_leaves()[0]
-    grid.get_layer(grid.SELECTION_LAYER_NAME).values[list(face.v)] = (0.25, 0.5, 1.0)
+    grid.selection_values[list(face.v)] = (0.25, 0.5, 1.0)
     grid.add_layer("temperature", np.arange(grid.vertex_count(), dtype=np.float64))
     original_values = {name: grid.get_layer(name).values.copy() for name in grid.layer_names()}
+    original_selection_values = grid.selection_values.copy()
 
     grid.subdivide_selected_faces_once()
 
@@ -108,8 +108,8 @@ def test_local_subdivision_uses_shared_spherical_edge_midpoints():
         expected /= np.linalg.norm(expected)
         np.testing.assert_allclose(grid.vertices[midpoint], expected)
         assert grid._edge_midpoints[tuple(sorted((i, j)))] == midpoint
-        for name in ("temperature", grid.SELECTION_LAYER_NAME):
-            assert grid.get_layer(name).values[midpoint] == (original_values[name][i] + original_values[name][j]) / 2.0
+        assert grid.get_layer("temperature").values[midpoint] == (original_values["temperature"][i] + original_values["temperature"][j]) / 2.0
+        assert grid.selection_values[midpoint] == (original_selection_values[i] + original_selection_values[j]) / 2.0
     for name, values in original_values.items():
         np.testing.assert_array_equal(grid.get_layer(name).values[:len(values)], values)
 
@@ -118,11 +118,11 @@ def test_local_subdivision_preserves_existing_midpoint_layer_values():
     grid = IcosphereGrid()
     grid.subdivide_uniform(1)
     face = grid._red_leaves()[0]
-    grid.get_layer(grid.SELECTION_LAYER_NAME).values[list(face.v)] = 1.0
+    grid.selection_values[list(face.v)] = 1.0
     grid.subdivide_selected_faces_once()
     midpoint = grid._face_child_midpoints(face)[0]
     grid.get_layer("elevation").values[midpoint] = 123.0
-    grid.get_layer(grid.SELECTION_LAYER_NAME).values[:] = 1.0
+    grid.selection_values[:] = 1.0
 
     grid.subdivide_selected_faces_once()
 
@@ -144,8 +144,7 @@ def test_local_subdivision_without_selection_does_not_change_mesh():
 def test_remove_selected_lowest_level_vertices_coarsens_selected_detail():
     grid = IcosphereGrid()
     grid.subdivide_uniform(2)
-    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-    selection.values[:] = 1.0
+    grid.selection_values[:] = 1.0
 
     removed_vertices = grid.remove_selected_lowest_level_vertices()
 
@@ -200,6 +199,8 @@ def test_sample_matches_vertex_values_at_vertices():
 def test_layers_support_metadata_and_ordered_storage():
     grid = IcosphereGrid()
     elevation = grid.get_layer("elevation")
+    assert isinstance(elevation, DataLayer)
+    assert isinstance(elevation, ElevationLayer)
     elevation.description = "Terrain height"
     elevation.opacity = 65.0
     elevation.legend = LayerLegend(name="topo", colormap=object())
@@ -215,7 +216,7 @@ def test_layers_support_metadata_and_ordered_storage():
         z_index=5,
     )
 
-    assert grid.layer_names() == ["elevation", "selection_status", "temperature"]
+    assert grid.layer_names() == ["elevation", "temperature"]
     assert elevation.name == "elevation"
     assert elevation.description == "Terrain height"
     assert elevation.opacity == 65.0
@@ -233,10 +234,55 @@ def test_layers_support_metadata_and_ordered_storage():
 def test_selection_layer_defaults_to_zero():
     grid = IcosphereGrid()
 
-    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-
-    np.testing.assert_allclose(selection.values, 0.0)
+    np.testing.assert_allclose(grid.selection_values, 0.0)
     assert grid.has_selection is False
+
+
+def test_serialized_state_keeps_selection_separate_from_data_layers():
+    grid = IcosphereGrid()
+    grid.add_layer("temperature", np.full(grid.vertex_count(), 12.0, dtype=np.float64))
+    grid.selection_values[:] = np.linspace(0.0, 1.0, grid.vertex_count(), dtype=np.float64)
+
+    state = grid.to_serialized_state()
+
+    assert [descriptor["name"] for descriptor in state["layer_metadata"]] == ["elevation", "temperature"]
+    assert all(descriptor["name"] != IcosphereGrid.SELECTION_LAYER_NAME for descriptor in state["layer_metadata"])
+    np.testing.assert_allclose(state["selection_values"], grid.selection_values)
+
+    round_tripped = IcosphereGrid.from_serialized_state(state)
+
+    assert round_tripped.layer_names() == ["elevation", "temperature"]
+    np.testing.assert_allclose(round_tripped.selection_values, grid.selection_values)
+    np.testing.assert_allclose(round_tripped.get_layer("temperature").values, 12.0)
+
+
+def test_serialized_state_loads_legacy_selection_layer_metadata():
+    grid = IcosphereGrid()
+    grid.selection_values[:] = np.linspace(0.0, 1.0, grid.vertex_count(), dtype=np.float64)
+
+    state = grid.to_serialized_state()
+    legacy_state = dict(state)
+    legacy_selection_key = "layer_values_legacy_selection"
+    legacy_state["layer_metadata"] = [
+        *state["layer_metadata"],
+        {
+            "kind": "elevation",
+            "name": IcosphereGrid.SELECTION_LAYER_NAME,
+            "description": "Soft vertex selection mask",
+            "visible": False,
+            "opacity": 100.0,
+            "legend_name": None,
+            "z_index": len(state["layer_metadata"]),
+            "values_key": legacy_selection_key,
+        },
+    ]
+    legacy_state[legacy_selection_key] = state["selection_values"]
+    legacy_state.pop("selection_values")
+
+    round_tripped = IcosphereGrid.from_serialized_state(legacy_state)
+
+    assert round_tripped.layer_names() == ["elevation"]
+    np.testing.assert_allclose(round_tripped.selection_values, grid.selection_values)
 
 
 def test_has_selection_tracks_positive_selection_values():
@@ -244,12 +290,11 @@ def test_has_selection_tracks_positive_selection_values():
 
     assert grid.has_selection is False
 
-    selection = grid.get_layer(IcosphereGrid.SELECTION_LAYER_NAME)
-    selection.values[0] = 0.25
+    grid.selection_values[0] = 0.25
 
     assert grid.has_selection is True
 
-    selection.values[:] = 0.0
+    grid.selection_values[:] = 0.0
 
     assert grid.has_selection is False
 
