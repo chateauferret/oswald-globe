@@ -34,6 +34,7 @@ class NoiseFilterOptionsDialog(NoiseToolOptionsDialog):
         lacunarity: float = 2.0,
         octaves: int = 6,
         seed: int = 0,
+        billow: bool = False,
     ):
         super().__init__(
             parent,
@@ -45,6 +46,7 @@ class NoiseFilterOptionsDialog(NoiseToolOptionsDialog):
             lacunarity=lacunarity,
             octaves=octaves,
             seed=seed,
+            billow=billow,
             include_radius=False,
             include_falloff=False,
         )
@@ -78,6 +80,7 @@ class NoiseFilterCommand:
     octaves: int
     seed: int
     apply_vertex_values: Callable[[np.ndarray, np.ndarray], None]
+    billow: bool = False
     vertex_indices: np.ndarray = field(init=False, repr=False)
     before_values: np.ndarray = field(init=False, repr=False)
     after_values: np.ndarray = field(init=False, repr=False)
@@ -100,6 +103,7 @@ class NoiseFilterCommand:
             lacunarity=self.lacunarity,
             octaves=self.octaves,
             seed=self.seed,
+            billow=self.billow,
         )
         self.after_values = ApplyValue.blend(self.before_values, noise_values, weights=selection_values)
 
@@ -122,6 +126,7 @@ class NoiseFilter(Filter):
         self._lacunarity = 2.0
         self._octaves = 6
         self._seed = 0
+        self._billow = False
 
     def create_menu_action(
         self,
@@ -129,12 +134,21 @@ class NoiseFilter(Filter):
         action_group: QActionGroup,
         on_selected: Callable[[], None],
     ) -> QAction:
-        action = QAction(self._menu_label, self._parent)
-        action.triggered.connect(lambda checked=False: on_selected())
-        filters_menu.addAction(action)
+        noise_menu = filters_menu.addMenu(self._menu_label)
+        noise_menu.menuAction().setCheckable(True)
+        noise_menu.menuAction().triggered.connect(
+            lambda checked=False: (noise_menu.menuAction().setChecked(True), on_selected())[1]
+        )
+        action = QAction("Simplex", self._parent)
+        action.setCheckable(True)
+        action.triggered.connect(
+            lambda checked=False: (noise_menu.menuAction().setChecked(True), on_selected())[1]
+        )
+        noise_menu.addAction(action)
+        action_group.addAction(noise_menu.menuAction())
         action_group.addAction(action)
-        self._menu_action = action
-        return action
+        self._menu_action = noise_menu.menuAction()
+        return noise_menu.menuAction()
 
     def create_options_dialog(self) -> NoiseFilterOptionsDialog:
         dialog = NoiseFilterOptionsDialog(
@@ -146,6 +160,7 @@ class NoiseFilter(Filter):
             lacunarity=self._lacunarity,
             octaves=self._octaves,
             seed=self._seed,
+            billow=self._billow,
         )
         dialog.applyRequested.connect(self._apply_from_dialog)
         return dialog
@@ -169,6 +184,7 @@ class NoiseFilter(Filter):
             self._lacunarity = float(self._options_dialog.lacunarity_spin.value())
             self._octaves = int(self._options_dialog.octaves_spin.value())
             self._seed = int(self._options_dialog.seed_spin.value())
+            self._billow = bool(self._options_dialog.billow_check.isChecked())
         super().dispose_options_dialog()
 
     def minimum_value(self) -> float:
@@ -206,6 +222,11 @@ class NoiseFilter(Filter):
             return int(self._options_dialog.seed_spin.value())
         return self._seed
 
+    def billow(self) -> bool:
+        if isinstance(self._options_dialog, NoiseFilterOptionsDialog):
+            return bool(self._options_dialog.billow_check.isChecked())
+        return self._billow
+
     def apply(self, gl_widget: Any | None = None) -> None:
         if gl_widget is None:
             viewer = getattr(self._parent, "viewer", None)
@@ -228,6 +249,7 @@ class NoiseFilter(Filter):
             lacunarity=self.lacunarity(),
             octaves=self.octaves(),
             seed=self.seed(),
+            billow=self.billow(),
             apply_vertex_values=gl_widget.apply_mesh_vertex_values,
         )
         undo_stack = getattr(gl_widget, "_undo_stack", None)

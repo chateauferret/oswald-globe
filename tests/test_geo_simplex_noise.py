@@ -53,6 +53,50 @@ def test_sample_changes_with_seed():
     assert first != pytest.approx(second)
 
 
+def test_sample_billow_uses_absolute_noise_before_scaling():
+    lat_deg = 12.5
+    lon_deg = -44.0
+    kwargs = dict(
+        minimum_value=-200.0,
+        maximum_value=300.0,
+        frequency=2.25,
+        persistence=0.7,
+        lacunarity=2.0,
+        octaves=4,
+        seed=1234,
+    )
+
+    signed = GeoSimplexNoise.sample(lat_deg, lon_deg, billow=False, **kwargs)
+    expected = GeoSimplexNoise.sample(lat_deg, lon_deg, billow=True, **kwargs)
+
+    coordinates = GeoSimplexNoise.unit_xyz(lat_deg, lon_deg)
+    permutation = GeoSimplexNoise._permutation_table(kwargs["seed"])
+    total = 0.0
+    amplitude = 1.0
+    amplitude_sum = 0.0
+    frequency = kwargs["frequency"]
+    for _ in range(kwargs["octaves"]):
+        total += amplitude * GeoSimplexNoise._noise3d(
+            coordinates[0] * frequency,
+            coordinates[1] * frequency,
+            coordinates[2] * frequency,
+            permutation,
+        )
+        amplitude_sum += amplitude
+        amplitude *= kwargs["persistence"]
+        frequency *= kwargs["lacunarity"]
+
+    normalized = 0.0 if amplitude_sum <= 0.0 else float(np.clip(total / amplitude_sum, -1.0, 1.0))
+    expected_from_formula = kwargs["minimum_value"] + abs(normalized) * (
+        kwargs["maximum_value"] - kwargs["minimum_value"]
+    )
+    assert expected == pytest.approx(expected_from_formula)
+    assert signed >= kwargs["minimum_value"]
+    assert signed <= kwargs["maximum_value"]
+    assert expected >= kwargs["minimum_value"]
+    assert expected <= kwargs["maximum_value"]
+
+
 def test_sample_stays_within_requested_range():
     value = GeoSimplexNoise.sample(
         -21.5,

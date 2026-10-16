@@ -7,7 +7,8 @@ from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QAbstractSpinBox, QDoubleSpinBox, QLabel, QSpinBox, QWidget
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import QAbstractSpinBox, QCheckBox, QDoubleSpinBox, QLabel, QSpinBox, QWidget
 
 from oswald_globe.algorithms.apply_value import ApplyValue
 from oswald_globe.algorithms.geo_simplex_noise import GeoSimplexNoise
@@ -32,6 +33,7 @@ class NoiseToolOptionsDialog(ToolOptionsDialog):
         lacunarity: float = 2.0,
         octaves: int = 6,
         seed: int = 0,
+        billow: bool = False,
         radius_km: int = 100,
         falloff_percent: int = 50,
         include_radius: bool = True,
@@ -55,6 +57,8 @@ class NoiseToolOptionsDialog(ToolOptionsDialog):
         self.lacunarity_spin = self._create_double_spin(0.0, 5.0, lacunarity, 0.1)
         self.octaves_spin = self._create_int_spin(0, 20, octaves, 1)
         self.seed_spin = self._create_int_spin(-(2**31), 2**31 - 1, seed, 1)
+        self.billow_check = QCheckBox("Billow")
+        self.billow_check.setChecked(bool(billow))
 
         inherited_rows = list(self._rows)
         self._rows = [
@@ -65,6 +69,7 @@ class NoiseToolOptionsDialog(ToolOptionsDialog):
             (QLabel("Lacunarity"), self.lacunarity_spin, None),
             (QLabel("Octaves"), self.octaves_spin, None),
             (QLabel("Seed"), self.seed_spin, None),
+            (QLabel(""), self.billow_check, None),
             *inherited_rows,
         ]
         self._relayout_controls()
@@ -107,6 +112,7 @@ class NoiseBrushCommand(BrushCommand):
     octaves: int
     seed: int
     apply_vertex_values: Callable[[np.ndarray, np.ndarray], None]
+    billow: bool = False
 
     def _apply(self, indices: np.ndarray, values: np.ndarray) -> None:
         self.apply_vertex_values(indices, values)
@@ -152,6 +158,7 @@ class NoiseBrushCommand(BrushCommand):
             lacunarity=self.lacunarity,
             octaves=self.octaves,
             seed=self.seed,
+            billow=self.billow,
         )
         after_values = ApplyValue.blend(before_values, noise_values, weights=brush_weights)
         return vertex_indices, before_values, after_values
@@ -169,6 +176,29 @@ class NoiseTool(BrushTool):
         self._lacunarity = 2.0
         self._octaves = 6
         self._seed = 0
+        self._billow = False
+
+    def create_menu_action(
+        self,
+        tools_menu,
+        action_group: Any,
+        on_selected: Callable[[], None],
+    ) -> Any:
+        noise_menu = tools_menu.addMenu(self._menu_label)
+        noise_menu.menuAction().setCheckable(True)
+        noise_menu.menuAction().triggered.connect(
+            lambda checked=False: (noise_menu.menuAction().setChecked(True), on_selected())[1]
+        )
+        action = QAction("Simplex", self._parent)
+        action.setCheckable(True)
+        action.triggered.connect(
+            lambda checked=False: (noise_menu.menuAction().setChecked(True), on_selected())[1]
+        )
+        noise_menu.addAction(action)
+        action_group.addAction(noise_menu.menuAction())
+        action_group.addAction(action)
+        self._menu_action = noise_menu.menuAction()
+        return noise_menu.menuAction()
 
     def create_options_dialog(self) -> NoiseToolOptionsDialog:
         dialog = NoiseToolOptionsDialog(
@@ -180,6 +210,7 @@ class NoiseTool(BrushTool):
             lacunarity=self._lacunarity,
             octaves=self._octaves,
             seed=self._seed,
+            billow=self._billow,
             radius_km=self._radius_km,
             falloff_percent=self._falloff_percent,
         )
@@ -196,6 +227,7 @@ class NoiseTool(BrushTool):
             self._lacunarity = float(self._options_dialog.lacunarity_spin.value())
             self._octaves = int(self._options_dialog.octaves_spin.value())
             self._seed = int(self._options_dialog.seed_spin.value())
+            self._billow = bool(self._options_dialog.billow_check.isChecked())
         super().dispose_options_dialog()
 
     def minimum_value(self) -> float:
@@ -233,6 +265,11 @@ class NoiseTool(BrushTool):
             return int(self._options_dialog.seed_spin.value())
         return self._seed
 
+    def billow(self) -> bool:
+        if isinstance(self._options_dialog, NoiseToolOptionsDialog):
+            return bool(self._options_dialog.billow_check.isChecked())
+        return self._billow
+
     def create_brush_command(self, payload: Dict[str, Any], gl_widget: Any) -> NoiseBrushCommand:
         mesh_grid = gl_widget.mesh_grid
         if mesh_grid is None:
@@ -249,6 +286,7 @@ class NoiseTool(BrushTool):
             lacunarity=self.lacunarity(),
             octaves=self.octaves(),
             seed=self.seed(),
+            billow=self.billow(),
             mesh_grid=mesh_grid,
             apply_vertex_values=gl_widget.apply_mesh_vertex_values,
         )

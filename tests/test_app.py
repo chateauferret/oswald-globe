@@ -320,9 +320,17 @@ def test_create_window(qapp, tmp_path: Path):
     assert [action.text() for action in window._select_menu.actions()] == ["All", "None", "Invert", "By value"]
     assert window._tools_menu is not None
     assert [action.text() for action in window._tools_menu.actions()] == ["Navigate", "Select", "Paint", "Noise"]
+    noise_tool_action = window._tools_menu.actions()[3]
+    noise_tool_menu = noise_tool_action.menu()
+    assert noise_tool_menu is not None
+    assert [action.text() for action in noise_tool_menu.actions()] == ["Simplex"]
     assert [action.text() for action in window._tools_menu.actions() if action.isChecked()] == ["Navigate"]
     assert window._filters_menu is not None
     assert [action.text() for action in window._filters_menu.actions()] == ["Fill", "Noise"]
+    noise_filter_action = window._filters_menu.actions()[1]
+    noise_filter_menu = noise_filter_action.menu()
+    assert noise_filter_menu is not None
+    assert [action.text() for action in noise_filter_menu.actions()] == ["Simplex"]
 
     assert window._legend_menu is not None
     assert window._legend_menu.toolTipsVisible() is True

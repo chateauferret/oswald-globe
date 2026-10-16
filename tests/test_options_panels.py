@@ -206,6 +206,7 @@ def test_noise_tool_options_panel_is_dockable_and_retain_values_when_floating(qa
         panel.lacunarity_spin.setValue(2.5)
         panel.octaves_spin.setValue(8)
         panel.seed_spin.setValue(99)
+        panel.billow_check.setChecked(True)
         panel.setFloating(True)
         qapp.processEvents()
         assert panel.isFloating()
@@ -216,6 +217,7 @@ def test_noise_tool_options_panel_is_dockable_and_retain_values_when_floating(qa
         assert panel.lacunarity_spin.value() == 2.5
         assert panel.octaves_spin.value() == 8
         assert panel.seed_spin.value() == 99
+        assert panel.billow_check.isChecked() is True
     finally:
         panel.close()
         window.close()

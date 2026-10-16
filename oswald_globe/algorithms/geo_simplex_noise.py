@@ -59,6 +59,7 @@ class GeoSimplexNoise:
         lacunarity: float,
         octaves: int,
         seed: int,
+        billow: bool = False,
     ) -> float:
         """Return fractal 3D Simplex noise mapped into the requested numeric range."""
         min_value = cls._validate_ranged_float("minimum_value", minimum_value, -32767.0, 32767.0)
@@ -72,6 +73,7 @@ class GeoSimplexNoise:
         lacunarity_value = cls._validate_ranged_float("lacunarity", lacunarity, 0.0, 5.0)
         octave_count = cls._validate_ranged_int("octaves", octaves, 0, 20)
         seed_value = operator.index(seed)
+        billow_value = bool(billow)
 
         if octave_count == 0:
             return float((min_value + max_value) * 0.5)
@@ -95,6 +97,9 @@ class GeoSimplexNoise:
             current_frequency *= lacunarity_value
 
         normalized_noise = 0.0 if amplitude_sum <= 0.0 else float(np.clip(total / amplitude_sum, -1.0, 1.0))
+        if billow_value:
+            normalized_noise = abs(normalized_noise)
+            return float(min_value + normalized_noise * (max_value - min_value))
         blend = (normalized_noise + 1.0) * 0.5
         return float(min_value + blend * (max_value - min_value))
 
@@ -111,6 +116,7 @@ class GeoSimplexNoise:
         lacunarity: float,
         octaves: int,
         seed: int,
+        billow: bool = False,
     ) -> np.ndarray:
         """Return 3D Simplex noise values for arrays of geolocations."""
         latitudes = np.asarray(lat_deg, dtype=np.float64)
@@ -132,6 +138,7 @@ class GeoSimplexNoise:
         lacunarity_value = cls._validate_ranged_float("lacunarity", lacunarity, 0.0, 5.0)
         octave_count = cls._validate_ranged_int("octaves", octaves, 0, 20)
         seed_value = operator.index(seed)
+        billow_value = bool(billow)
 
         if octave_count == 0:
             midpoint = (min_value + max_value) * 0.5
@@ -161,7 +168,11 @@ class GeoSimplexNoise:
                 current_frequency *= lacunarity_value
 
             normalized_noise = 0.0 if amplitude_sum <= 0.0 else float(np.clip(total / amplitude_sum, -1.0, 1.0))
-            flat_values[index] = min_value + ((normalized_noise + 1.0) * 0.5) * (max_value - min_value)
+            if billow_value:
+                normalized_noise = abs(normalized_noise)
+                flat_values[index] = min_value + normalized_noise * (max_value - min_value)
+            else:
+                flat_values[index] = min_value + ((normalized_noise + 1.0) * 0.5) * (max_value - min_value)
         return values
 
     @staticmethod
