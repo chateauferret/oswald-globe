@@ -113,6 +113,30 @@ def test_sample_stays_within_requested_range():
     assert -32767.0 <= value <= 32767.0
 
 
+def test_sample_many_fills_requested_range_symmetrically_about_zero():
+    latitudes = np.linspace(-90.0, 90.0, 500)
+    longitudes = np.linspace(-180.0, 180.0, 500)
+    kwargs = dict(
+        minimum_value=-32767.0,
+        maximum_value=32767.0,
+        frequency=1.5,
+        persistence=0.7,
+        lacunarity=2.0,
+        octaves=6,
+        seed=13,
+    )
+
+    signed = GeoSimplexNoise.sample_many(latitudes, longitudes, **kwargs)
+    billow = GeoSimplexNoise.sample_many(latitudes, longitudes, billow=True, **kwargs)
+
+    assert signed.min() < -30000.0
+    assert signed.max() > 30000.0
+    assert signed.min() == pytest.approx(-signed.max(), abs=5000.0)
+    assert billow.min() < -30000.0
+    assert billow.max() > 30000.0
+    assert billow.min() == pytest.approx(-billow.max(), abs=5000.0)
+
+
 def test_zero_octaves_returns_range_midpoint():
     value = GeoSimplexNoise.sample(
         51.0,

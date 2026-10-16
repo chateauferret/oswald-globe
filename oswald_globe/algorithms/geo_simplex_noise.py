@@ -97,11 +97,12 @@ class GeoSimplexNoise:
             current_frequency *= lacunarity_value
 
         normalized_noise = 0.0 if amplitude_sum <= 0.0 else float(np.clip(total / amplitude_sum, -1.0, 1.0))
+        midpoint = 0.5 * (min_value + max_value)
+        half_span = 0.5 * (max_value - min_value)
+        centered_noise = normalized_noise
         if billow_value:
-            normalized_noise = abs(normalized_noise)
-            return float(min_value + normalized_noise * (max_value - min_value))
-        blend = (normalized_noise + 1.0) * 0.5
-        return float(min_value + blend * (max_value - min_value))
+            centered_noise = 2.0 * abs(normalized_noise) - 1.0
+        return float(midpoint + centered_noise * half_span)
 
     @classmethod
     def sample_many(
@@ -149,6 +150,7 @@ class GeoSimplexNoise:
         flat_latitudes = latitudes.ravel()
         flat_longitudes = longitudes.ravel()
         flat_values = values.ravel()
+        raw_noise = np.empty(flat_latitudes.shape, dtype=np.float64)
 
         for index, (latitude, longitude) in enumerate(zip(flat_latitudes, flat_longitudes)):
             coordinates = cls.unit_xyz(float(latitude), float(longitude))
@@ -167,12 +169,24 @@ class GeoSimplexNoise:
                 amplitude *= persistence_value
                 current_frequency *= lacunarity_value
 
-            normalized_noise = 0.0 if amplitude_sum <= 0.0 else float(np.clip(total / amplitude_sum, -1.0, 1.0))
-            if billow_value:
-                normalized_noise = abs(normalized_noise)
-                flat_values[index] = min_value + normalized_noise * (max_value - min_value)
+            raw_noise[index] = 0.0 if amplitude_sum <= 0.0 else float(np.clip(total / amplitude_sum, -1.0, 1.0))
+
+        if billow_value:
+            raw_noise = np.abs(raw_noise)
+            min_noise = float(np.min(raw_noise))
+            max_noise = float(np.max(raw_noise))
+            if max_noise > min_noise:
+                raw_noise = 2.0 * ((raw_noise - min_noise) / (max_noise - min_noise)) - 1.0
             else:
-                flat_values[index] = min_value + ((normalized_noise + 1.0) * 0.5) * (max_value - min_value)
+                raw_noise.fill(0.0)
+        else:
+            max_abs = float(np.max(np.abs(raw_noise)))
+            if max_abs > 0.0:
+                raw_noise = raw_noise / max_abs
+
+        midpoint = 0.5 * (min_value + max_value)
+        half_span = 0.5 * (max_value - min_value)
+        values[:] = midpoint + raw_noise.reshape(values.shape) * half_span
         return values
 
     @staticmethod
